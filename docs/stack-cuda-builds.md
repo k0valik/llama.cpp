@@ -7,22 +7,16 @@
 
 Each uses CUDA 13.1, `120a-real` for the RTX 5070 Ti, CUDA graphs, and a conservative AVX2 CPU baseline rather than the hosted runner's native CPU. Windows uses MSVC; Linux uses GCC. These settings make the two variants comparable on the same OS, but are not identical to the recipe's original Linux compiler and flags or the local Windows clang-cl script. Compare matching artifacts from the same workflow run. The artifacts include the CUDA runtime libraries, `BUILD-INFO.txt`, CMake cache, server/CLI/bench binaries and available test binaries. The coupled-sampling test is not registered by the reference or target for Windows shared-library builds; it is built on Linux when present. UI and OpenSSL are disabled.
 
-## Trigger without changing the default branch
+## Trigger the workflow
 
-GitHub requires a workflow to exist on the default branch before the Actions UI or `workflow_dispatch` can run it. Until this workflow is added there, push a **new** tag at the desired commit:
-
-```sh
-git switch port/feveromo-v0.8.0
-git pull --ff-only
-git tag stack-build/2026-11-03-01 HEAD
-git push origin stack-build/2026-11-03-01
-```
-
-Use a unique tag on each run; never retarget an existing tag. The tag must point to a commit containing the workflow. A normal tag push launches all four jobs; regular branch pushes do not. To retry only the two candidate jobs, use a tag starting with `stack-build/candidate-only-`; the reference jobs are omitted. After the workflow is on the default branch, it can also be launched from the Actions UI or with:
+The workflow is registered on the default branch and runs only when manually dispatched. Select the port branch in the Actions UI, or run:
 
 ```sh
-gh workflow run stack-cuda-build.yml --repo k0valik/llama.cpp --ref port/feveromo-v0.8.0
+gh workflow run stack-cuda-build.yml --repo k0valik/llama.cpp \
+  --ref port/feveromo-v0.8.0-consolidated -f variant=both
 ```
+
+Use `variant=candidate` or `variant=reference` to build only that variant for both operating systems. The default is `both`. The selected ref supplies the workflow and the candidate source; the reference always uses the pinned base and patch. Dispatching this workflow does not trigger unrelated push workflows.
 
 ## Download and test
 
