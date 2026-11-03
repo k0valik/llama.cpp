@@ -18,7 +18,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        variant: [reference, candidate]
+        variant: ${{ fromJSON(startsWith(github.ref, 'refs/tags/stack-build/candidate-only-') && '["candidate"]' || '["reference", "candidate"]') }}
     steps:
       - name: Install build dependencies
         run: |
@@ -106,7 +106,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        variant: [reference, candidate]
+        variant: ${{ fromJSON(startsWith(github.ref, 'refs/tags/stack-build/candidate-only-') && '["candidate"]' || '["reference", "candidate"]') }}
     steps:
       - name: Use LF for source checkouts
         shell: pwsh
