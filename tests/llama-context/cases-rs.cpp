@@ -9,6 +9,7 @@
 
 #include <cmath>
 #include <string>
+#include <utility>
 #include <vector>
 
 // roll back multiple sequences, then replay them in a single batch whose per-seq token count exceeds n_ubatch: each
@@ -179,6 +180,66 @@ struct case_multi_seq_split_replay : ctx_test {
         TLOG_INF("%s: seq-1-only decode is independent of seq 0 (max diff %g, nmse %g)\n",
                 __func__, (double) diff_tail.diff_max, diff_tail.nmse());
 
+        return case_result::pass();
+    }
+};
+
+// A released cell must not pass pending replay rows to a new sequence.
+struct case_new_seq_in_released_cell : ctx_test {
+    test_group group() const override { return TEST_GROUP_RS; }
+    const char * name() const override { return "released-cell"; }
+    const char * description() const override { return "a new sequence starts empty in a previously released cell"; }
+
+    case_result run(model_run & mr) const override {
+        const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(mr.model));
+        ctx_opts opts;
+        opts.n_seq_max = 3;
+        opts.n_rs_seq = 3;
+        opts.n_ctx = 256;
+        opts.n_batch = 64;
+        opts.n_ubatch = 32;
+        opts.kv_unified = 1;
+        llama_context_ptr ctx = mr.ctx(opts);
+        llama_context_ptr ref = mr.ctx(opts);
+        CTX_REQUIRE(ctx && ref, "failed to initialize contexts");
+
+        using part = std::pair<llama_seq_id, std::pair<llama_pos, int>>;
+        const auto decode = [&](llama_context * c, const std::vector<part> & parts, bool logits) {
+            common_batch batch(c);
+            for (const auto & [seq, pn] : parts) {
+                for (int i = 0; i < pn.second; ++i) {
+                    const llama_pos pos = pn.first + i;
+                    const llama_token tok = (llama_token) ((13*(uint32_t) pos + 7*(uint32_t) seq + 3) % (uint32_t) n_vocab);
+                    batch.add(tok, pos, seq, logits);
+                }
+            }
+            return llama_process(c, LLAMA_PROCESS_TYPE_DECODE, batch.get()) == 0;
+        };
+        bool ok = true;
+        for (llama_context * c : { ctx.get(), ref.get() }) {
+            llama_memory_t mem = llama_get_memory(c);
+            ok = ok && decode(c, { { 0, { 0, 8 } }, { 1, { 0, 8 } }, { 2, { 0, 8 } } }, false);
+            ok = ok && decode(c, { { 1, { 8, 3 } } }, false);
+            if (c == ref.get()) {
+                llama_memory_seq_rm(mem, 1, 8, -1); // May be refused; releasing the cell is required.
+            }
+            ok = ok && llama_memory_seq_rm(mem, 1, -1, -1);
+            ok = ok && decode(c, { { 0, { 8, 2 } }, { 2, { 8, 2 } } }, false);
+            ok = ok && decode(c, { { 1, { 0, 5 } } }, true);
+        }
+        CTX_REQUIRE(ok, "released-cell decode failed");
+        logits_diff diff;
+        for (int i = 0; i < 5; ++i) {
+            const float * a = llama_get_logits_ith(ctx.get(), i);
+            const float * b = llama_get_logits_ith(ref.get(), i);
+            CTX_REQUIRE(a && b, "missing released-cell logits");
+            diff.add(a, b, n_vocab);
+        }
+        std::vector<uint8_t> a, b;
+        ok = get_seq_state(ctx.get(), 1, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY, a) &&
+             get_seq_state(ref.get(), 1, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY, b);
+        CTX_REQUIRE(ok && !a.empty() && a == b && diff.diff_max == 0.0f && diff.n_nan == 0,
+                    "new sequence retained state from a released cell");
         return case_result::pass();
     }
 };
@@ -421,6 +482,7 @@ struct case_shared_seq_reserve : ctx_test {
 std::vector<ctx_test_ptr> make_rs_cases() {
     std::vector<ctx_test_ptr> cases;
 
+    cases.push_back(std::make_unique<case_new_seq_in_released_cell>());
     cases.push_back(std::make_unique<case_rollback>());
     cases.push_back(std::make_unique<case_multi_seq_split_replay>());
     cases.push_back(std::make_unique<case_shared_seq_reserve>());

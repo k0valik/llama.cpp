@@ -121,6 +121,14 @@ struct llama_context {
     void set_embeddings_nextn(bool value, bool masked);
     void set_embeddings_layer_inp(uint32_t lid, bool enable);
     void set_nextn_layer_offset(int32_t offset);
+
+    int32_t mtp_draft_head_init(const llama_token * ids, int32_t n_ids, int32_t n_capacity);
+    int32_t mtp_draft_head_add (const llama_token * ids, int32_t n_ids);
+    int32_t mtp_draft_head_n_free() const;
+    void    mtp_draft_head_reset();
+    void    mtp_set_draft_steps(int32_t n_steps);
+    int32_t mtp_get_draft      (llama_token * tokens, float * probs, float * confs, int32_t n_max);
+    void    mtp_set_draft_noise(uint32_t seed, uint32_t k0, float temp, int32_t top_k, float top_p);
     void set_causal_attn(bool value);
     void set_warmup(bool value);
 
@@ -263,7 +271,7 @@ public:
     bool set_sampler(llama_seq_id seq_id, llama_sampler * sampler);
 
 private:
-    llm_graph_result * get_gf_res_prev();
+    llm_graph_result * get_gf_res_prev(uint32_t n_tokens = 0);
 
     llm_graph_params graph_params(
                         llm_graph_result * res,
@@ -308,6 +316,38 @@ private:
 
     llama_memory_ptr memory;
     llama_moe_cache_ptr moe_cache;
+
+    // reduced-vocabulary greedy draft head (MTP contexts, see llama_mtp_draft_head_init)
+    struct mtp_draft_head_state {
+        ggml_context_ptr        ctx;
+        ggml_backend_buffer_ptr buf;
+        ggml_backend_t          backend = nullptr;
+
+        llama_mtp_draft_head t;
+
+        ggml_tensor * src_head = nullptr; // model tensors the rows are copied from
+        ggml_tensor * src_embd = nullptr;
+
+        int32_t cap      = 0;
+        int32_t n_static = 0; // rows from llama_mtp_draft_head_init
+        int32_t n_used   = 0; // rows holding real tokens
+        int32_t n_active = 0; // rows seen by the graph (n_used rounded up, padded with copies of row 0)
+
+        std::vector<int32_t> slot_of;  // [n_vocab] token -> row or -1
+        std::vector<float>   map_host; // [cap]     row -> token id
+
+        bool warned_full = false;
+
+        // copy rows [r_src, r_src + n) of src into rows [r_dst, r_dst + n) of dst (async on backend)
+        void copy_rows(ggml_tensor * src, int64_t r_src, ggml_tensor * dst, int64_t r_dst, int64_t n);
+        // append tokens (must not be present yet) at rows [n_used, n_used + n)
+        void append(const llama_token * ids, int32_t n);
+        // set the active window to n_used rounded up, padding with copies of row 0
+        void set_active(bool repad);
+    };
+
+    std::unique_ptr<mtp_draft_head_state> mtp_dh;
+    std::vector<float> mtp_draft_out; // (token, prob, confidence) per step of the last draft decode
 
     // decode output (2-dimensional array: [n_outputs][n_vocab])
     buffer_view<float> logits = {nullptr, 0};
@@ -411,8 +451,12 @@ private:
     std::vector<ggml_backend_buffer_type_t> backend_buft;
     std::vector<size_t>                     backend_buf_exp_size; // expected buffer sizes
 
-    // Separate arenas give batches with and without outputs distinct CUDA graph cache keys.
-    std::array<llm_graph_result_ptr, 2> gf_res_prev;
+    // Separate arenas give batches with and without outputs distinct CUDA graph cache keys. Small ubatches with
+    // outputs (1..GF_RES_N_SMALL tokens: speculative verify batches of varying width) also get one arena per size, so
+    // that alternating between widths reuses the built graphs and their CUDA graphs instead of rebuilding them
+    // (each arena holds a graph's worth of tensor metadata, ~13 MB of host memory for a 27B model).
+    static constexpr uint32_t GF_RES_N_SMALL = 8;
+    std::array<llm_graph_result_ptr, 2 + GF_RES_N_SMALL> gf_res_prev;
     llm_graph_result_ptr gf_res_reserve;
 
     llm_graph_result * gf_res_prev_active = nullptr;

@@ -778,3 +778,60 @@ void ggml_cuda_op_relu_sqr(ggml_backend_cuda_context & ctx, ggml_tensor * relu_n
         unary_cuda<op_relu_sqr>((const float *)src->data, (float *)sqr_node->data, k, stream);
     }
 }
+
+// out = act(g) * x for rows of ncols values (act = silu or sigmoid), optionally also written as q8_1 with the
+// quantize_row_q8_1_cuda layout (one warp per q8_1 block). g may be a strided 2D view per row:
+// element c of row r is g[r*g_s2 + (c / g_ne0)*g_s1 + c % g_ne0].
+template <bool act_sigmoid, bool do_q8>
+static __global__ void gated_act_q8_kernel(const float * g, const float * x, float * out, void * q8,
+                                           const int ncols, const int g_ne0, const int64_t g_s1, const int64_t g_s2,
+                                           const int64_t x_s1, const int64_t out_s1, const int64_t q8_row_blocks) {
+    ggml_cuda_pdl_lc();
+    const int     row = blockIdx.y;
+    const int64_t c   = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+
+    ggml_cuda_pdl_sync();
+
+    if (c >= ncols) {
+        return; // ncols % 32 == 0: whole warps leave together
+    }
+    const float gv = g[row * g_s2 + (c / g_ne0) * g_s1 + c % g_ne0];
+    const float xv = x[row * x_s1 + c];
+    const float a  = act_sigmoid ? 1.0f / (1.0f + expf(-gv)) : ggml_cuda_op_silu_single(gv);
+    const float v  = act_sigmoid ? xv * a : a * xv;
+    out[row * out_s1 + c] = v;
+
+    if constexpr (do_q8) {
+        const int   lane = threadIdx.x % WARP_SIZE;
+        const float amax = warp_reduce_max<WARP_SIZE>(fabsf(v));
+        const float sum  = warp_reduce_sum<WARP_SIZE>(v);
+        const float d    = amax / 127.0f;
+        block_q8_1 * qb = (block_q8_1 *) q8 + row * q8_row_blocks + c / QK8_1;
+        qb->qs[lane] = amax == 0.0f ? 0 : roundf(v / d);
+        if (lane == 0) {
+            qb->ds = make_half2(d, sum);
+        }
+    }
+}
+
+bool ggml_cuda_gated_act_q8(ggml_backend_cuda_context & ctx, const bool act_sigmoid, const float * g, const float * x,
+                            float * out, void * q8, const int ncols, const int nrows, const int g_ne0,
+                            const int64_t g_s1, const int64_t g_s2, const int64_t x_s1, const int64_t out_s1,
+                            const int64_t q8_row_blocks) {
+    if (ncols % WARP_SIZE != 0 || g_ne0 <= 0 || nrows < 1 || nrows > 65535) {
+        return false;
+    }
+    const int threads = 256;
+    const dim3 grid((ncols + threads - 1) / threads, nrows);
+    const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(grid, dim3(threads), 0, ctx.stream());
+    auto launch = [&](auto SIG, auto Q8) {
+        ggml_cuda_kernel_launch(gated_act_q8_kernel<decltype(SIG)::value, decltype(Q8)::value>, launch_params,
+            g, x, out, q8, ncols, g_ne0, g_s1, g_s2, x_s1, out_s1, q8_row_blocks);
+    };
+    if (act_sigmoid) {
+        if (q8) { launch(std::true_type{}, std::true_type{}); } else { launch(std::true_type{}, std::false_type{}); }
+    } else {
+        if (q8) { launch(std::false_type{}, std::true_type{}); } else { launch(std::false_type{}, std::false_type{}); }
+    }
+    return true;
+}

@@ -36,7 +36,9 @@ void ggml_compute_forward_sum_rows(const struct ggml_compute_params * params, st
 void ggml_compute_forward_cumsum(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_mean(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_argmax(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+void ggml_compute_forward_add_gumbel(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_count_equal(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+void ggml_compute_forward_add_gumbel(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_repeat(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_repeat_back(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_concat(const struct ggml_compute_params * params, struct ggml_tensor * dst);
@@ -104,6 +106,7 @@ void ggml_compute_forward_rwkv_wkv7(const struct ggml_compute_params * params, s
 void ggml_compute_forward_solve_tri(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_gla(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_gated_delta_net(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+void ggml_compute_forward_gated_delta_net_replay(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_lightning_indexer(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_dsv4_hc_comb(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_dsv4_hc_pre(const struct ggml_compute_params * params, struct ggml_tensor * dst);

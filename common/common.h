@@ -300,6 +300,10 @@ struct common_params_sampling {
 
     bool backend_sampling = false;
 
+    // replace the final random draw (dist) with a Gumbel-max draw that uses counter-based noise, so that a speculative
+    // drafter can add the same noise to its own logits (see common_sampler_get_coupled). Same output distribution.
+    bool coupled = false;
+
     // print the parameters into a string
     std::string print() const;
 };
@@ -337,6 +341,12 @@ struct common_params_speculative_draft {
     bool backend_sampling = true; // offload draft sampling to the backend (default: on)
 
     bool probabilistic = false; // sample the draft and verify by rejection, instead of argmax and match
+    // MTP only: greedy drafting of all n_max steps in one graph over a reduced-vocabulary draft head
+    std::string vocab_file;        // token ids, most important first (empty = disabled)
+    int32_t     vocab_n   = 0;     // use only the first N ids of vocab_file (0 = all)
+    int32_t     vocab_ctx = 8192;  // extra head rows for tokens seen in the context (0 = static head only)
+    bool        fuse_catchup = false; // merge the MTP catch-up of the verified tokens into the next draft graph
+    bool        adaptive     = false; // choose the draft length per cycle from the measured acceptance and cost (up to n_max)
 
     common_params_model mparams;
 
