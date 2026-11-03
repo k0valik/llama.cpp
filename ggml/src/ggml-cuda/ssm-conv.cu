@@ -205,3 +205,202 @@ void ggml_cuda_op_ssm_conv(ggml_backend_cuda_context & ctx, ggml_tensor * dst, g
                           out->nb[2], nc, nr, n_t, n_s, stream);
     }
 }
+
+// Fused short-sequence conv-state path (see ggml_cuda_try_fuse_conv_state in ggml-cuda.cu):
+//   [get_rows(conv states)] -> concat(state, x^T) -> K x cpy(snapshot window -> cache) -> ssm_conv -> silu
+// One thread per channel builds the (d_conv - 1 + n_t) window in shared memory, writes the snapshots and the
+// silu'd conv outputs. Every thread only touches its own channel in every buffer, so reading the state row
+// and writing snapshot rows of the same cache in one kernel is race-free (single sequence only).
+template <int d_conv, int max_t>
+static __global__ void ssm_conv_state_fused_f32(
+        const char * st, const int32_t * st_row, const int64_t st_row_nb, const int64_t st_nb0, const int64_t st_nb1,
+        const char * x, const int64_t x_nb0, const int64_t x_nb1,
+        const float * w, const int64_t w_s1,
+        float * y, const int64_t y_s1,
+        const ggml_cuda_conv_state_snapshots snaps, const int nr, const int n_t) {
+    constexpr int n_state = d_conv - 1;
+    constexpr int n_win   = n_state + max_t;
+
+    extern __shared__ float win_smem[];
+    const int tid = threadIdx.x;
+    const int c   = blockIdx.x * blockDim.x + tid;
+
+    float wr[d_conv];
+#pragma unroll
+    for (int j = 0; j < d_conv; ++j) {
+        wr[j] = c < nr ? w[c * w_s1 + j] : 0.0f;
+    }
+
+    ggml_cuda_pdl_lc();
+
+    if (c >= nr) {
+        ggml_cuda_pdl_sync();
+        return;
+    }
+
+    // the state row must not be read before the wait: an earlier node of the same graph may still be writing it
+    // (e.g. the scale_inplace that zeroes the row of a new sequence)
+    ggml_cuda_pdl_sync();
+
+    float win[n_win];
+    {
+        const char * st_c = st + (st_row ? (int64_t) st_row[0] * st_row_nb : 0) + c * st_nb1;
+#pragma unroll
+        for (int j = 0; j < n_state; ++j) {
+            win[j] = *(const float *) (st_c + j * st_nb0);
+        }
+    }
+#pragma unroll
+    for (int t = 0; t < max_t; ++t) {
+        win[n_state + t] = t < n_t ? *(const float *) (x + t * x_nb0 + c * x_nb1) : 0.0f;
+    }
+
+    // snapshots: window [off, off + n_state) -> dst[c * n_state + j]; off is runtime, so go through smem
+#pragma unroll
+    for (int j = 0; j < n_win; ++j) {
+        win_smem[j * blockDim.x + tid] = win[j];
+    }
+    for (int s = 0; s < snaps.n; ++s) {
+        const int off = snaps.off[s];
+        float * dst = snaps.dst[s] + (int64_t) c * n_state;
+#pragma unroll
+        for (int j = 0; j < n_state; ++j) {
+            dst[j] = win_smem[(off + j) * blockDim.x + tid];
+        }
+    }
+
+#pragma unroll
+    for (int t = 0; t < max_t; ++t) {
+        if (t < n_t) {
+            float sumf = 0.0f;
+#pragma unroll
+            for (int j = 0; j < d_conv; ++j) {
+                sumf += win[t + j] * wr[j];
+            }
+            y[t * y_s1 + c] = ggml_cuda_op_silu_single(sumf);
+        }
+    }
+}
+
+// Long-sequence variant of the fused conv-state path (prefill): the grid also splits the tokens (chunks of
+// tchunk per block row); each thread streams its channel over the chunk with a sliding window. The snapshot windows
+// are read straight from the state / new inputs by the first token chunk.
+template <int d_conv, int tchunk>
+static __global__ void ssm_conv_state_fused_long_f32(
+        const char * st, const int32_t * st_row, const int64_t st_row_nb, const int64_t st_nb0, const int64_t st_nb1,
+        const char * x, const int64_t x_nb0, const int64_t x_nb1,
+        const float * w, const int64_t w_s1,
+        float * y, const int64_t y_s1,
+        const ggml_cuda_conv_state_snapshots snaps, const int nr, const int n_t) {
+    constexpr int n_state = d_conv - 1;
+    const int c  = blockIdx.x * blockDim.x + threadIdx.x;
+    const int t0 = blockIdx.y * tchunk;
+
+    ggml_cuda_pdl_lc();
+
+    float wr[d_conv];
+#pragma unroll
+    for (int j = 0; j < d_conv; ++j) {
+        wr[j] = c < nr ? w[c * w_s1 + j] : 0.0f;
+    }
+
+    ggml_cuda_pdl_sync();
+
+    if (c >= nr) {
+        return;
+    }
+
+    const char * st_c = st + (st_row ? (int64_t) st_row[0] * st_row_nb : 0) + c * st_nb1;
+    const char * x_c  = x + c * x_nb1;
+    // window position p: p < n_state -> state, else new input p - n_state
+    auto win = [&](const int p) -> float {
+        return p < n_state ? *(const float *) (st_c + p * st_nb0) : *(const float *) (x_c + (int64_t) (p - n_state) * x_nb0);
+    };
+
+    // the window start (which may be the state) is read before any snapshot is written: a snapshot row may alias
+    // the state row. Snapshots are written by the first token chunk, each reading its window before writing.
+    float h[n_state];
+#pragma unroll
+    for (int j = 0; j < n_state; ++j) {
+        h[j] = win(t0 + j);
+    }
+
+    if (blockIdx.y == 0) {
+        float v[GGML_CUDA_CONV_STATE_MAX_SNAPSHOTS][n_state];
+        for (int s = 0; s < snaps.n; ++s) {
+#pragma unroll
+            for (int j = 0; j < n_state; ++j) {
+                v[s][j] = win(snaps.off[s] + j);
+            }
+        }
+        for (int s = 0; s < snaps.n; ++s) {
+            float * dst = snaps.dst[s] + (int64_t) c * n_state;
+#pragma unroll
+            for (int j = 0; j < n_state; ++j) {
+                dst[j] = v[s][j];
+            }
+        }
+    }
+    const int t1 = min(n_t, t0 + tchunk);
+#pragma unroll 8
+    for (int t = t0; t < t1; ++t) {
+        const float xt = *(const float *) (x_c + (int64_t) t * x_nb0);
+        float sumf = 0.0f;
+#pragma unroll
+        for (int j = 0; j < n_state; ++j) {
+            sumf += h[j] * wr[j];
+        }
+        sumf += xt * wr[n_state];
+        y[(int64_t) t * y_s1 + c] = ggml_cuda_op_silu_single(sumf);
+#pragma unroll
+        for (int j = 0; j < n_state - 1; ++j) {
+            h[j] = h[j + 1];
+        }
+        h[n_state - 1] = xt;
+    }
+}
+
+bool ggml_cuda_op_ssm_conv_state_fused(ggml_backend_cuda_context & ctx, const ggml_cuda_conv_state_fused_args & a) {
+    const int threads = 128;
+    const int nblocks = (a.nr + threads - 1) / threads;
+    cudaStream_t stream = ctx.stream();
+
+    auto launch = [&](auto NC, auto MT) {
+        constexpr int kNC = decltype(NC)::value;
+        constexpr int kMT = decltype(MT)::value;
+        const size_t smem = (size_t) threads * (kNC - 1 + kMT) * sizeof(float);
+        const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(dim3(nblocks), dim3(threads), smem, stream);
+        ggml_cuda_kernel_launch(ssm_conv_state_fused_f32<kNC, kMT>, launch_params,
+            a.st, a.st_row, a.st_row_nb, a.st_nb0, a.st_nb1, a.x, a.x_nb0, a.x_nb1, a.w, a.w_s1, a.y, a.y_s1,
+            a.snaps, a.nr, a.n_t);
+    };
+    if (a.n_t > GGML_CUDA_CONV_STATE_MAX_T) {
+        constexpr int tchunk = 32;
+        const dim3 grid(nblocks, (a.n_t + tchunk - 1) / tchunk);
+        const ggml_cuda_kernel_launch_params lp = ggml_cuda_kernel_launch_params(grid, dim3(threads), 0, stream);
+        auto launch_long = [&](auto NC) {
+            ggml_cuda_kernel_launch(ssm_conv_state_fused_long_f32<decltype(NC)::value, tchunk>, lp,
+                a.st, a.st_row, a.st_row_nb, a.st_nb0, a.st_nb1, a.x, a.x_nb0, a.x_nb1, a.w, a.w_s1, a.y, a.y_s1,
+                a.snaps, a.nr, a.n_t);
+        };
+        switch (a.d_conv) {
+            case 3: launch_long(std::integral_constant<int, 3>{}); return true;
+            case 4: launch_long(std::integral_constant<int, 4>{}); return true;
+            default: return false;
+        }
+    }
+    auto launch_nc = [&](auto NC) {
+        if (a.n_t <= 4) {
+            launch(NC, std::integral_constant<int, 4>{});
+        } else if (a.n_t <= 8) {
+            launch(NC, std::integral_constant<int, 8>{});
+        } else {
+            launch(NC, std::integral_constant<int, 16>{});
+        }
+    };
+    switch (a.d_conv) {
+        case 3: launch_nc(std::integral_constant<int, 3>{}); return true;
+        case 4: launch_nc(std::integral_constant<int, 4>{}); return true;
+        default: return false;
+    }
+}

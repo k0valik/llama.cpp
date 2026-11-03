@@ -136,3 +136,8 @@ __device__ __forceinline__ float ggml_cuda_op_glu_single(ggml_glu_op op, float g
             return up * gate;
     }
 }
+
+// out = act(g) * x (act: sigmoid or silu), rows of ncols, optionally also as q8_1 rows of q8_row_blocks blocks
+bool ggml_cuda_gated_act_q8(ggml_backend_cuda_context & ctx, bool act_sigmoid, const float * g, const float * x,
+                            float * out, void * q8, int ncols, int nrows, int g_ne0, int64_t g_s1, int64_t g_s2,
+                            int64_t x_s1, int64_t out_s1, int64_t q8_row_blocks);

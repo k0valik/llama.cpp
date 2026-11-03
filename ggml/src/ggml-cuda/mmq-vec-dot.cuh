@@ -218,6 +218,19 @@ static __device__ __forceinline__ void ggml_cuda_mmq_vec_dot_q8_0_q8_1_mma(
     tile_A A[ntx][MMQ_TILE_NE_K/QI8_0];
     float dA[ntx][tile_C::ne/2][MMQ_TILE_NE_K/QI8_0];
 
+    // Warp-specialized kernels (Blackwell): int32 -> float conversion folded into the x scale. The accumulator starts
+    // at the bit pattern of MAGIC = 1.5*2^23, so the result read as a float is exactly MAGIC + dot (|dot| <= 32*128*128
+    // = 2^19 < 2^22). fmaf(MAGIC + dot, dA, -MAGIC*dA) then equals float(dot)*dA bit for bit because MAGIC*dA is exact
+    // (dA has <= 22 significant bits: fp16 scale times a small integer). This replaces I2F + FMUL by one FFMA.
+#if defined(BLACKWELL_MMA_AVAILABLE)
+    constexpr bool magic = ggml_cuda_mmq_ws_nwarps(type) > 0 && ggml_cuda_mmq_ws_J(type, J);
+#else
+    constexpr bool magic = false;
+#endif // defined(BLACKWELL_MMA_AVAILABLE)
+    constexpr int   magic_i = 0x4B400000;
+    constexpr float magic_f = 12582912.0f;
+    float nMdA[magic ? ntx : 1][tile_C::ne/2][MMQ_TILE_NE_K/QI8_0];
+
     const int i0 = (threadIdx.y/ntx)*rows_per_warp;
 
 #pragma unroll
@@ -238,6 +251,9 @@ static __device__ __forceinline__ void ggml_cuda_mmq_vec_dot_q8_0_q8_1_mma(
                 const int k0 = k00 + k01;
 
                 dA[n][l][k01/QI8_0] = x_df[i*sram_stride + k0/QI8_0];
+                if constexpr (magic) {
+                    nMdA[n][l][k01/QI8_0] = -magic_f*dA[n][l][k01/QI8_0];
+                }
             }
         }
     }
@@ -265,11 +281,22 @@ static __device__ __forceinline__ void ggml_cuda_mmq_vec_dot_q8_0_q8_1_mma(
 #pragma unroll
             for (int n = 0; n < ntx; ++n) {
                 tile_C C;
+                if constexpr (magic) {
+#pragma unroll
+                    for (int l = 0; l < tile_C::ne; ++l) {
+                        C.x[l] = magic_i;
+                    }
+                }
                 mma(C, A[n][k01/QI8_0], B);
 
 #pragma unroll
                 for (int l = 0; l < tile_C::ne; ++l) {
-                    sum[(j0/tile_C::J + n)*tile_C::ne + l] += C.x[l]*dA[n][l/2][k01/QI8_0]*dB[l%2];
+                    if constexpr (magic) {
+                        sum[(j0/tile_C::J + n)*tile_C::ne + l] +=
+                            fmaf(__int_as_float(C.x[l]), dA[n][l/2][k01/QI8_0], nMdA[n][l/2][k01/QI8_0])*dB[l%2];
+                    } else {
+                        sum[(j0/tile_C::J + n)*tile_C::ne + l] += C.x[l]*dA[n][l/2][k01/QI8_0]*dB[l%2];
+                    }
                 }
             }
         }

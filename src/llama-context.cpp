@@ -14,6 +14,7 @@
 #include "llama-sampler.h"
 #include "llama.h"
 
+#include <algorithm>
 #include <cinttypes>
 #include <cmath>
 #include <cstring>
@@ -1376,6 +1377,294 @@ void llama_context::set_nextn_layer_offset(int32_t offset) {
     cparams.nextn_layer_offset = offset;
 }
 
+void llama_context::mtp_draft_head_state::copy_rows(ggml_tensor * src, int64_t r_src, ggml_tensor * dst, int64_t r_dst, int64_t n) {
+    GGML_ASSERT(src->type == dst->type && src->ne[0] == dst->ne[0] && src->nb[1] == dst->nb[1]);
+    GGML_ASSERT(r_src >= 0 && r_src + n <= src->ne[1] && r_dst >= 0 && r_dst + n <= dst->ne[1]);
+
+    const size_t rb = src->nb[1];
+
+    if (ggml_backend_buffer_is_host(src->buffer)) {
+        ggml_backend_tensor_set_async(backend, dst, (const char *) src->data + r_src*rb, r_dst*rb, n*rb);
+        return;
+    }
+
+    // device -> device through views of the two tensors
+    ggml_init_params params = {
+        /*.mem_size   =*/ 2*ggml_tensor_overhead(),
+        /*.mem_buffer =*/ NULL,
+        /*.no_alloc   =*/ true,
+    };
+    ggml_context_ptr tmp { ggml_init(params) };
+
+    ggml_tensor * vs = ggml_view_2d(tmp.get(), src, src->ne[0], n, rb, r_src*rb);
+    ggml_tensor * vd = ggml_view_2d(tmp.get(), dst, dst->ne[0], n, rb, r_dst*rb);
+    vs->buffer = src->buffer;
+    vd->buffer = dst->buffer;
+
+    ggml_backend_tensor_copy_async(backend, backend, vs, vd);
+}
+
+void llama_context::mtp_draft_head_state::append(const llama_token * ids, int32_t n) {
+    GGML_ASSERT(n_used + n <= cap);
+
+    const int32_t r0 = n_used;
+
+    // coalesce runs of consecutive token ids into single copies
+    for (int32_t i = 0; i < n; ) {
+        int32_t j = i + 1;
+        while (j < n && ids[j] == ids[j - 1] + 1) {
+            ++j;
+        }
+        copy_rows(src_head, ids[i], t.head, r0 + i, j - i);
+        copy_rows(src_embd, ids[i], t.embd, r0 + i, j - i);
+        i = j;
+    }
+
+    for (int32_t i = 0; i < n; ++i) {
+        slot_of[ids[i]] = r0 + i;
+        map_host[r0 + i] = (float) ids[i];
+    }
+    n_used += n;
+
+    ggml_backend_tensor_set_async(backend, t.map, map_host.data() + r0, r0*sizeof(float), n*sizeof(float));
+
+    set_active(/*repad =*/ false);
+}
+
+void llama_context::mtp_draft_head_state::set_active(bool repad) {
+    // the active window grows in steps of 1024 rows; the rows past n_used are copies of row 0 (same token)
+    // rows [n_used, n_active) already hold such copies unless repad is set
+    const int32_t n_active_new = std::min(cap, GGML_PAD(n_used, 1024));
+    const int32_t r0 = repad ? n_used : std::max(n_used, n_active);
+    if (n_active_new > r0) {
+        for (int32_t r = r0; r < n_active_new; ++r) {
+            copy_rows(t.head, 0, t.head, r, 1);
+            copy_rows(t.embd, 0, t.embd, r, 1);
+            map_host[r] = map_host[0];
+        }
+        ggml_backend_tensor_set_async(backend, t.map, map_host.data() + r0, r0*sizeof(float), (n_active_new - r0)*sizeof(float));
+    }
+
+    n_active = n_active_new;
+    t.n_used = n_used;
+
+    // the host sources (map_host, mmapped embeddings) must stay valid until the copies are done
+    ggml_backend_synchronize(backend);
+}
+
+int32_t llama_context::mtp_draft_head_init(const llama_token * ids, int32_t n_ids, int32_t n_capacity) {
+    const auto & hparams = model.hparams;
+
+    if (cparams.ctx_type != LLAMA_CONTEXT_TYPE_MTP || model.arch != LLM_ARCH_QWEN35 || hparams.n_layer_nextn != 1) {
+        LLAMA_LOG_WARN("%s: the reduced draft head is only supported for qwen35 MTP contexts\n", __func__);
+        return -1;
+    }
+    if (!cparams.flash_attn) {
+        LLAMA_LOG_WARN("%s: the reduced draft head requires flash attention\n", __func__);
+        return -1;
+    }
+
+    const auto & layer = model.layers[hparams.n_layer()];
+    if (layer.wqkv != nullptr) {
+        LLAMA_LOG_WARN("%s: fused QKV MTP layers are not supported\n", __func__);
+        return -1;
+    }
+
+    ggml_tensor * src_head = layer.nextn.shared_head_head ? layer.nextn.shared_head_head : model.output;
+    ggml_tensor * src_embd = layer.nextn.embed_tokens     ? layer.nextn.embed_tokens     : model.tok_embd;
+    if (!src_head || !src_embd || !src_head->buffer || !src_embd->buffer ||
+        (layer.nextn.shared_head_head ? layer.nextn.shared_head_head_s : model.output_s) != nullptr) {
+        LLAMA_LOG_WARN("%s: unsupported LM head / embedding layout\n", __func__);
+        return -1;
+    }
+
+    const int32_t n_vocab = src_head->ne[1];
+
+    // dedupe + validate, keep the given order (most important first)
+    std::vector<llama_token> uniq;
+    {
+        std::vector<bool> seen(n_vocab, false);
+        for (int32_t i = 0; i < n_ids; ++i) {
+            const llama_token id = ids[i];
+            if (id >= 0 && id < n_vocab && !seen[id]) {
+                seen[id] = true;
+                uniq.push_back(id);
+            }
+        }
+    }
+
+    const int32_t cap = std::min(n_vocab, std::max(n_capacity, (int32_t) uniq.size()));
+    if (uniq.empty() || cap <= 0) {
+        return -1;
+    }
+
+    ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(src_head->buffer);
+
+    ggml_backend_t backend = nullptr;
+    for (auto & b : backends) {
+        if (ggml_backend_supports_buft(b.get(), buft)) {
+            backend = b.get();
+            break;
+        }
+    }
+    if (!backend) {
+        LLAMA_LOG_WARN("%s: no backend for the LM head buffer type %s\n", __func__, ggml_backend_buft_name(buft));
+        return -1;
+    }
+
+    auto st = std::make_unique<mtp_draft_head_state>();
+
+    {
+        ggml_init_params params = {
+            /*.mem_size   =*/ 3*ggml_tensor_overhead(),
+            /*.mem_buffer =*/ NULL,
+            /*.no_alloc   =*/ true,
+        };
+        st->ctx.reset(ggml_init(params));
+    }
+
+    st->t.head = ggml_new_tensor_2d(st->ctx.get(), src_head->type, src_head->ne[0], cap);
+    st->t.embd = ggml_new_tensor_2d(st->ctx.get(), src_embd->type, src_embd->ne[0], cap);
+    st->t.map  = ggml_new_tensor_2d(st->ctx.get(), GGML_TYPE_F32,   1,               cap);
+    ggml_set_name(st->t.head, "mtp_draft_head");
+    ggml_set_name(st->t.embd, "mtp_draft_embd");
+    ggml_set_name(st->t.map,  "mtp_draft_map");
+
+    st->buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(st->ctx.get(), buft));
+    if (!st->buf) {
+        LLAMA_LOG_WARN("%s: failed to allocate the draft head (%d rows)\n", __func__, cap);
+        return -1;
+    }
+
+    st->backend  = backend;
+    st->src_head = src_head;
+    st->src_embd = src_embd;
+    st->cap      = cap;
+    st->slot_of.assign(n_vocab, -1);
+    st->map_host.assign(cap, 0.0f);
+
+    // copy in id order to maximize the run coalescing, the row order does not matter
+    std::vector<llama_token> sorted = uniq;
+    std::sort(sorted.begin(), sorted.end());
+
+    const int64_t t_start_us = ggml_time_us();
+    st->append(sorted.data(), (int32_t) sorted.size());
+    st->n_static = st->n_used;
+    st->t.slot_of = st->slot_of.data();
+
+    LLAMA_LOG_INFO("%s: MTP draft head: %d static rows, capacity %d rows (%.1f MiB %s), built in %.1f ms\n", __func__,
+            st->n_used, cap, ggml_backend_buffer_get_size(st->buf.get())/1024.0/1024.0, ggml_backend_buft_name(buft),
+            (ggml_time_us() - t_start_us)/1000.0);
+
+    mtp_dh = std::move(st);
+
+    cparams.mtp_head_rows = mtp_dh->n_active;
+
+    return mtp_dh->n_used;
+}
+
+int32_t llama_context::mtp_draft_head_add(const llama_token * ids, int32_t n_ids) {
+    if (!mtp_dh) {
+        return 0;
+    }
+
+    auto & st = *mtp_dh;
+
+    std::vector<llama_token> add;
+    for (int32_t i = 0; i < n_ids; ++i) {
+        const llama_token id = ids[i];
+        if (id < 0 || id >= (llama_token) st.slot_of.size() || st.slot_of[id] != -1) {
+            continue; // invalid, present, or already pending in this call
+        }
+        if (st.n_used + (int32_t) add.size() >= st.cap) {
+            if (!st.warned_full) {
+                LLAMA_LOG_INFO("%s: MTP draft head is full (%d rows), new context tokens are not added\n", __func__, st.cap);
+                st.warned_full = true;
+            }
+            break;
+        }
+        st.slot_of[id] = -2; // pending (dedupe within this call)
+        add.push_back(id);
+    }
+
+    if (add.empty()) {
+        return 0;
+    }
+
+    std::sort(add.begin(), add.end());
+    st.append(add.data(), (int32_t) add.size());
+
+    cparams.mtp_head_rows = st.n_active;
+
+    return (int32_t) add.size();
+}
+
+int32_t llama_context::mtp_draft_head_n_free() const {
+    return mtp_dh ? mtp_dh->cap - mtp_dh->n_used : 0;
+}
+
+void llama_context::mtp_draft_head_reset() {
+    if (!mtp_dh) {
+        return;
+    }
+
+    auto & st = *mtp_dh;
+
+    for (int32_t r = st.n_static; r < st.n_used; ++r) {
+        st.slot_of[(llama_token) st.map_host[r]] = -1;
+    }
+    st.n_used      = st.n_static;
+    st.warned_full = false;
+    st.set_active(/*repad =*/ true);
+
+    cparams.mtp_head_rows = st.n_active;
+}
+
+void llama_context::mtp_set_draft_steps(int32_t n_steps) {
+    if (n_steps > 0 && mtp_dh) {
+        cparams.mtp_draft_steps = n_steps;
+        cparams.mtp_head        = &mtp_dh->t;
+        cparams.mtp_head_rows   = mtp_dh->n_active;
+    } else {
+        cparams.mtp_draft_steps = 0;
+        cparams.mtp_head        = nullptr;
+    }
+}
+
+void llama_context::mtp_set_draft_noise(uint32_t seed, uint32_t k0, float temp, int32_t top_k, float top_p) {
+    if (!mtp_dh) {
+        return;
+    }
+
+    cparams.mtp_draft_noise = temp > 0.0f;
+
+    auto & t = mtp_dh->t;
+    t.noise_seed  = seed;
+    t.noise_k0    = k0;
+    t.noise_temp  = temp > 0.0f ? temp : 0.0f;
+    t.noise_top_k = std::clamp(top_k, 0, 128);
+    t.noise_top_p = top_p;
+}
+
+int32_t llama_context::mtp_get_draft(llama_token * tokens, float * probs, float * confs, int32_t n_max) {
+    synchronize();
+
+    const int32_t n = std::min<int32_t>(n_max, (int32_t) mtp_draft_out.size()/3);
+    for (int32_t i = 0; i < n; ++i) {
+        if (tokens) {
+            tokens[i] = (llama_token) mtp_draft_out[3*i + 0];
+        }
+        if (probs) {
+            probs[i] = mtp_draft_out[3*i + 1];
+        }
+        if (confs) {
+            confs[i] = mtp_draft_out[3*i + 2];
+        }
+    }
+
+    return n;
+}
+
 void llama_context::set_causal_attn(bool value) {
     LLAMA_LOG_DEBUG("%s: value = %d\n", __func__, value);
 
@@ -1529,7 +1818,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         return nullptr;
     }
 
-    auto * res = get_gf_res_prev();
+    auto * res = get_gf_res_prev(ubatch.n_tokens);
     auto * gf  = res->get_gf();
 
     // the new graph parameters
@@ -1545,6 +1834,25 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         if (cparams.pipeline_parallel) {
             ggml_backend_sched_synchronize(sched.get());
         }
+
+        n_reused++;
+    } else if (!graph_reuse_disable && gf_res_prev_active != res && !res->srcs.empty() && res->can_reuse(gparams)) {
+        // a graph built earlier for another ubatch size (see gf_res_prev): the scheduler holds the allocation of
+        // the last graph, so only the allocation is redone (same graph -> same addresses -> its CUDA graph stays valid)
+        gf_res_prev_active = nullptr;
+
+        res->restore_srcs();
+
+        ggml_backend_sched_reset(sched.get());
+        ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
+
+        if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
+            LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
+            ret = GGML_STATUS_ALLOC_FAILED;
+            return nullptr;
+        }
+
+        gf_res_prev_active = res;
 
         n_reused++;
     } else {
@@ -1564,6 +1872,10 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             LLAMA_LOG_ERROR("%s: failed to initialize graph\n", __func__);
             ret = GGML_STATUS_FAILED;
             return nullptr;
+        }
+
+        if (n_outputs > 0 && ubatch.n_tokens <= GF_RES_N_SMALL) {
+            res->save_srcs(); // an arena of its own size (see gf_res_prev)
         }
 
         if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
@@ -1919,6 +2231,33 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 
     GGML_ASSERT((cparams.causal_attn || cparams.n_ubatch >= n_tokens_all) && "non-causal attention requires n_ubatch >= n_tokens");
 
+    if (cparams.mtp_draft_steps > 0) {
+        bool one_seq = true;
+        for (const auto & tok : batch_inp.tokens) {
+            one_seq &= tok.seq_ids.size() == 1 && tok.seq_ids == batch_inp.tokens[0].seq_ids;
+        }
+        if (!one_seq || n_tokens_all > cparams.n_ubatch || (int32_t) n_tokens_all < cparams.mtp_draft_steps) {
+            LLAMA_LOG_ERROR("%s: invalid MTP draft batch (n_tokens = %u, n_steps = %d, n_ubatch = %u)\n",
+                    __func__, n_tokens_all, cparams.mtp_draft_steps, cparams.n_ubatch);
+            return -1;
+        }
+
+        // take the first-pass embeddings from the head when all those tokens are (or can be put) in it
+        const int32_t n_first = (int32_t) n_tokens_all - cparams.mtp_draft_steps + 1;
+        std::vector<llama_token> first(n_first);
+        for (int32_t i = 0; i < n_first; ++i) {
+            first[i] = batch_inp.tokens[i].id;
+        }
+        mtp_draft_head_add(first.data(), n_first);
+
+        bool dev_embd = true;
+        for (const llama_token id : first) {
+            dev_embd &= id >= 0 && id < (llama_token) mtp_dh->slot_of.size() && mtp_dh->slot_of[id] >= 0;
+        }
+        cparams.mtp_dev_embd = dev_embd;
+    }
+    mtp_draft_out.clear();
+
     // TODO: this clear of the buffer can easily be forgotten - need something better
     // sync first so any in-flight async copies into embd_seq complete before it is freed
     if (!embd_seq.empty()) {
@@ -2144,6 +2483,14 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 
         // [TAG_EXTRACT_TARGET_EMBEDDINGS]
         bool extract_all_idxs = extract_layer_inputs(res, n_tokens_prev, ubatch.n_tokens);
+
+        if (res->t_mtp_draft) {
+            ggml_backend_t backend_d = ggml_backend_sched_get_tensor_backend(sched.get(), res->t_mtp_draft);
+            GGML_ASSERT(backend_d != nullptr);
+
+            mtp_draft_out.resize(ggml_nelements(res->t_mtp_draft));
+            ggml_backend_tensor_get_async(backend_d, res->t_mtp_draft, mtp_draft_out.data(), 0, ggml_nbytes(res->t_mtp_draft));
+        }
 
         // extract nextn embeddings before
         // only meaningful in LLAMA_POOLING_TYPE_NONE (per-token); other pooling modes are ignored.
@@ -2576,8 +2923,8 @@ llm_graph_result * llama_context::get_gf_res_reserve() const {
     return static_cast<llm_graph_result *>(gf_res_reserve.get());
 }
 
-llm_graph_result * llama_context::get_gf_res_prev() {
-    auto & res = gf_res_prev[n_outputs > 0];
+llm_graph_result * llama_context::get_gf_res_prev(uint32_t n_tokens) {
+    auto & res = gf_res_prev[n_outputs == 0 ? 0 : 1 + (n_tokens <= GF_RES_N_SMALL ? n_tokens : 0)];
     if (!res) {
         res.reset(new llm_graph_result(gf_res_reserve->get_max_nodes()));
     }
@@ -2674,7 +3021,11 @@ ggml_cgraph * llama_context::graph_reserve(
 
     auto * res = gf_res_reserve.get();
 
-    const auto gparams = graph_params(res, ubatch, mctx, ctx_type_to_graph_type(cparams.ctx_type));
+    auto gparams = graph_params(res, ubatch, mctx, ctx_type_to_graph_type(cparams.ctx_type));
+
+    // reserve the regular graph also when called from a decode in MTP draft mode (memory_update after a seq_cp or shift):
+    // the reserve ubatch has no (token, embd) rows for the draft graph
+    gparams.cparams.mtp_draft_steps = 0;
 
     res->reset();
 
@@ -4286,6 +4637,34 @@ void llama_set_embeddings_layer_inp(llama_context * ctx, uint32_t lid, bool valu
 
 void llama_set_nextn_layer_offset(llama_context * ctx, int32_t offset) {
     ctx->set_nextn_layer_offset(offset);
+}
+
+int32_t llama_mtp_draft_head_init(llama_context * ctx, const llama_token * ids, int32_t n_ids, int32_t n_capacity) {
+    return ctx->mtp_draft_head_init(ids, n_ids, n_capacity);
+}
+
+int32_t llama_mtp_draft_head_add(llama_context * ctx, const llama_token * ids, int32_t n_ids) {
+    return ctx->mtp_draft_head_add(ids, n_ids);
+}
+
+int32_t llama_mtp_draft_head_n_free(llama_context * ctx) {
+    return ctx->mtp_draft_head_n_free();
+}
+
+void llama_mtp_draft_head_reset(llama_context * ctx) {
+    ctx->mtp_draft_head_reset();
+}
+
+void llama_mtp_set_draft_steps(llama_context * ctx, int32_t n_steps) {
+    ctx->mtp_set_draft_steps(n_steps);
+}
+
+int32_t llama_mtp_get_draft(llama_context * ctx, llama_token * tokens, float * probs, float * confs, int32_t n_max) {
+    return ctx->mtp_get_draft(tokens, probs, confs, n_max);
+}
+
+void llama_mtp_set_draft_noise(llama_context * ctx, uint32_t seed, uint32_t k0, float temp, int32_t top_k, float top_p) {
+    ctx->mtp_set_draft_noise(seed, k0, temp, top_k, top_p);
 }
 
 llama_memory_t llama_get_memory(const struct llama_context * ctx) {

@@ -26,6 +26,17 @@ void quantize_mmq_q8_1_cuda(
         ggml_type type_src0, int64_t ne00, int64_t s01, int64_t s02, int64_t s03,
         int64_t ne0, int64_t ne1, int64_t ne2, int64_t ne3, cudaStream_t stream);
 
+// silu(a)*b quantized to the MMQ q8_1 layout (a, b: ne1 rows of ne00 floats with row strides s_a, s_b; ne0: padded row length)
+void quantize_mmq_q8_1_silu_mul_cuda(
+        const float * a, const float * b, void * vy, ggml_type type_src0,
+        int64_t ne00, int64_t s_a, int64_t s_b, int64_t ne0, int64_t ne1, cudaStream_t stream);
+
+// silu(z) * (rms_norm(o)*w) quantized to the MMQ q8_1 layout, the rms norm groups are the 128 value blocks of the rows
+// (o, z: ne1 contiguous rows of ne00 floats, w: 128 floats). false if unsupported (nothing launched).
+bool quantize_mmq_q8_1_rms_silu_mul_cuda(
+        const float * o, const float * w, const float * z, void * vy, ggml_type type_src0, float eps,
+        int64_t ne00, int64_t ne0, int64_t ne1, cudaStream_t stream);
+
 void quantize_mmq_fp4_cuda(const float *   x,
                              const int32_t * ids,
                              void *          vy,

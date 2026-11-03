@@ -22,6 +22,7 @@
 #include "mtmd.h"
 #include "mtmd-helper.h"
 #include "base64.hpp"
+#include "../../src/llama-ext.h" // llama_get_ctx_other: shared target/draft memory
 
 #include <algorithm>
 #include <cstddef>
@@ -411,6 +412,7 @@ struct server_slot {
     // accepted tokens per draft position
     // not in server_slot_stats to avoid copying to every task result
     std::vector<uint64_t> n_accepted_per_pos;
+    std::vector<uint64_t> n_draft_len; // verify cycles by draft length
 
     std::function<void(int /* id_slot */)>   callback_on_release;
     std::function<void(const server_slot &)> callback_on_reset; // called before reset()
@@ -447,6 +449,7 @@ struct server_slot {
         // note: callback_on_reset() must have run before this, see release()
         stats = {};
         n_accepted_per_pos.clear();
+        n_draft_len.clear();
 
         n_predict_max = -1;
 
@@ -800,6 +803,14 @@ struct server_slot {
                     draft_ratio, n_draft_accepted, n_draft_total, mean_acc_len);
             SLT_TRC(*this,
                     "     acc per pos = (%s)\n", acceptance_rates_per_pos.c_str());
+
+            if (task && task->params.speculative.draft.adaptive) {
+                std::string lens;
+                for (size_t i = 1; i < n_draft_len.size(); ++i) {
+                    lens += string_format("%s%zu:%" PRIu64, lens.empty() ? "" : " ", i, n_draft_len[i]);
+                }
+                SLT_INF(*this, "   draft lengths = %s\n", lens.c_str());
+            }
         }
 
         common_speculative_print_stats(spec);
@@ -842,18 +853,32 @@ struct server_slot {
     }
 
     // the other slot continues from the tokens processed so far
-    void copy_prompt_to(server_slot & other) const {
+    void copy_prompt_to(server_slot & other, bool copy_spec) const {
+        std::vector<uint8_t> data_spec;
+        if (copy_spec && !common_speculative_get_state(spec, id, data_spec)) {
+            throw std::runtime_error("failed to copy speculative prompt state");
+        }
         mem.seq_rm(other.id,     -1, -1);
         mem.seq_cp(id, other.id, -1, -1);
+        if (copy_spec) {
+            common_speculative_set_state(spec, other.id, data_spec);
+        }
 
         other.prompt = prompt.clone();
     }
 
-    void copy_state_to(server_slot & other) const {
+    void copy_state_to(server_slot & other, bool copy_spec) const {
         GGML_ASSERT(state == SLOT_STATE_DONE_PROMPT);
 
+        std::vector<uint8_t> data_spec;
+        if (copy_spec && !common_speculative_get_state(spec, id, data_spec)) {
+            throw std::runtime_error("failed to copy speculative prompt state");
+        }
         mem.seq_rm(other.id,     -1, -1);
         mem.seq_cp(id, other.id, -1, -1);
+        if (copy_spec) {
+            common_speculative_set_state(spec, other.id, data_spec);
+        }
 
         other.i_batch = i_batch;
 
@@ -1074,6 +1099,15 @@ private:
     // use server_context methods instead
 
     common_params params_base;
+
+    bool has_mtp() const {
+        const auto & types = params_base.speculative.types;
+        return std::find(types.begin(), types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != types.end();
+    }
+
+    bool has_shared_mtp() const {
+        return has_mtp() && ctx_dft && llama_get_ctx_other(ctx_dft) == ctx_tgt;
+    }
 
     // note: keep these alive - they determine the lifetime of the model, context, etc.
     common_init_result_ptr llama_init;
@@ -1503,6 +1537,22 @@ private:
             ctx_dft_seq_rm_type = common_context_can_seq_rm(ctx_dft);
         }
 
+        // External prompt-cache and slot-file lifecycles do not yet carry MTP state.
+        if (spec_mtp) {
+            const auto & types = params_base.speculative.types;
+            const bool eagle = std::find(types.begin(), types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3) != types.end();
+            if (!spec || !ctx_dft || params_base.ctx_shift || eagle ||
+                    ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_NO ||
+                    ctx_dft_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_NO) {
+                SRV_ERR("%s", "MTP requires no context shift, sequence rollback support and no Eagle3; prompt/copy state is not supported\n");
+                return false;
+            }
+            SRV_WRN("%s", "MTP prompt reuse requires a compatible context checkpoint; otherwise the prompt is reprocessed\n");
+            if (has_shared_mtp()) {
+                SRV_WRN("%s", "shared-memory MTP disables prompt checkpoints, RAM prompt caching and slot save/restore\n");
+            }
+        }
+
         if (spec) {
             SRV_TRC("%s", "speculative decoding context initialized\n");
         } else {
@@ -1878,7 +1928,7 @@ private:
         }
 
         if (ret) {
-            update_cache = update_cache && prompt_cache;
+            update_cache = update_cache && prompt_cache && !has_shared_mtp();
 
             // cache prompts only for the tasks that reuse them
             update_cache = update_cache && !task.is_stateless();
@@ -2697,7 +2747,7 @@ private:
         GGML_ASSERT(child_slots.size() == parent_task.child_tasks.size());
         for (auto * slot : child_slots) {
             // keep the state that the child task is about to overwrite
-            if (prompt_cache && slot->prompt_save(*prompt_cache)) {
+            if (prompt_cache && !has_shared_mtp() && slot->prompt_save(*prompt_cache)) {
                 prompt_cache->update();
             }
 
@@ -2990,7 +3040,10 @@ private:
                 return n_read;
             }
         }
-        if (!data_spec.empty()) {
+        // For MTP the live saved boundary is not necessarily the next request's
+        // common-prefix boundary. Prefill restores a compatible checkpoint or
+        // replays from zero, including for older files without MTP state.
+        if (!data_spec.empty() && !has_mtp()) {
             common_speculative_set_state(spec.get(), slot.id, data_spec);
         }
         SLT_INF(slot, "restored the draft state (%.3f MiB) from '%s'\n", (float) n_read / 1024 / 1024, filepath.c_str());
@@ -3068,7 +3121,7 @@ private:
                         break; // drop the task
                     }
 
-                    if (params_base.cache_idle_slots) {
+                    if (params_base.cache_idle_slots && !has_shared_mtp()) {
                         for (auto & slot : slots) {
                             if (!slot.is_processing()) {
                                 SLT_TRC(slot, "%s", "saving idle slot to prompt cache\n");
@@ -3213,6 +3266,10 @@ private:
                 } break;
             case SERVER_TASK_TYPE_SLOT_SAVE:
                 {
+                    if (has_shared_mtp()) {
+                        send_error(task, "Slot save is not supported with shared-memory MTP", ERROR_TYPE_NOT_SUPPORTED);
+                        break;
+                    }
                     const int id_slot = task.slot_action.id_slot;
                     server_slot * slot = get_slot_by_id(id_slot);
                     if (slot == nullptr) {
@@ -3275,6 +3332,10 @@ private:
                 } break;
             case SERVER_TASK_TYPE_SLOT_RESTORE:
                 {
+                    if (has_shared_mtp()) {
+                        send_error(task, "Slot restore is not supported with shared-memory MTP", ERROR_TYPE_NOT_SUPPORTED);
+                        break;
+                    }
                     const int id_slot = task.slot_action.id_slot;
                     server_slot * slot = get_slot_by_id(id_slot);
                     if (slot == nullptr) {
@@ -3585,6 +3646,11 @@ private:
         } catch (const std::exception & e) {
             SRV_ERR("pre_decode() failed: %s\n", e.what());
             abort_all_slots("pre_decode() failed: " + std::string(e.what()));
+            if (!common_speculative_is_healthy(spec.get())) {
+                for (auto & slot : slots) {
+                    slot.prompt_clear();
+                }
+            }
 
             // the batch is half-built and not rendered, skip now to avoid UB
             return;
@@ -3654,6 +3720,11 @@ private:
             } catch (const std::exception & e) {
                 SRV_ERR("decode() failed: %s\n", e.what());
                 abort_all_slots("decode() failed: " + std::string(e.what()));
+                if (!common_speculative_is_healthy(spec.get())) {
+                    for (auto & slot : slots) {
+                        slot.prompt_clear();
+                    }
+                }
                 break; // stop any further processing
             }
 
@@ -3759,6 +3830,9 @@ private:
     }
 
     void pre_decode() {
+        if (!common_speculative_is_healthy(spec.get())) {
+            throw std::runtime_error("speculative context is unusable after a decode failure; restart the server");
+        }
         // apply context-shift if needed
         // TODO: simplify and improve
         iterate(slots, [&](server_slot & slot) {
@@ -3881,6 +3955,9 @@ private:
                                 slot.prompt.n_tokens(),
                                 llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot.id),
                                 llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id));
+                        if (has_mtp() && !common_speculative_get_state(spec.get(), slot.id, slot.spec_ckpt.data_spec)) {
+                            throw std::runtime_error("failed to save MTP speculative checkpoint state");
+                        }
 
                         if (use_ckpt_dft) {
                             slot.spec_ckpt.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
@@ -3889,8 +3966,8 @@ private:
                         slot.spec_prompt = slot.prompt.tokens.get_text_tokens();
 
                         const bool spec_reject = slot.use_spec_rejection();
-
-                        common_speculative_get_draft_params(spec.get(), slot.id) = {
+                        auto & dp = common_speculative_get_draft_params(spec.get(), slot.id);
+                        dp = {
                             /* .drafting = */ true,
                             /* .n_max    = */ n_draft_max,
                             /* .pos0     = */ slot.prompt.tokens.pos_next(),
@@ -3900,7 +3977,11 @@ private:
                             /* .result_q = */ spec_reject ? &slot.spec_draft_q : nullptr,
                             /* .temp     = */ slot.task->params.sampling.temp,
                             /* .seed     = */ slot.task->params.sampling.seed,
+                            /* .coupled  = */ {},
                         };
+
+                        // the next draw of the target sampler verifies the first draft token
+                        common_sampler_get_coupled(slot.smpl.get(), dp.coupled);
 
                         drafting.push_back(&slot);
                     }
@@ -3910,9 +3991,13 @@ private:
 
         // generate the actual drafts (if any)
         if (!drafting.empty()) {
+            bool ok = true;
             queue_tasks.yield_to_queue([&]() {
-                common_speculative_draft(spec.get());
+                ok = common_speculative_draft_checked(spec.get());
             });
+            if (!ok) {
+                throw std::runtime_error("speculative drafting failed; restart the server");
+            }
         }
 
         // make checkpoints if needed
@@ -4123,7 +4208,7 @@ private:
                                 const auto n_cache_reuse = slot.task->params.n_cache_reuse;
 
                                 const bool can_cache_reuse =
-                                    llama_memory_can_shift(llama_get_memory(ctx_tgt)) &&
+                                    !has_mtp() && llama_memory_can_shift(llama_get_memory(ctx_tgt)) &&
                                     !slot.prompt.tokens.has_mtmd;
 
                                 if (!can_cache_reuse && n_cache_reuse > 0) {
@@ -4184,6 +4269,48 @@ private:
                                 n_past = 0;
                             }
 
+                            if (has_mtp()) {
+                                // A freshly copied child owns the exact boundary state. All other
+                                // reuse must restore a checkpoint for the chosen prefix; a live
+                                // boundary row cannot be rewound to an arbitrary common prefix.
+                                const bool copied_boundary = slot.task->is_child() && slot.task->n_tokens_shared > 0 &&
+                                    n_past == slot.prompt.n_tokens() && n_past < slot.task->n_tokens();
+                                if (!copied_boundary) {
+                                    const int n_prefix_mtp = std::min(n_past, slot.task->n_tokens() - 1);
+                                    const auto it = std::find_if(slot.prompt.checkpoints.rbegin(), slot.prompt.checkpoints.rend(),
+                                        [&](const auto & ckpt) {
+                                            if (ckpt.n_tokens <= 0 || ckpt.n_tokens > n_prefix_mtp ||
+                                                ckpt.data_tgt.empty() || ckpt.data_dft.empty() ||
+                                                !common_speculative_mtp_state_valid(spec.get(), ckpt.data_spec)) {
+                                                return false;
+                                            }
+                                            const llama_pos next = slot.prompt.tokens.pos_next(ckpt.n_tokens);
+                                            const llama_pos min_needed = std::max(0, n_swa > 0 ? next - n_swa + 2 : next);
+                                            return ckpt.pos_min >= 0 && ckpt.pos_max == next - 1 &&
+                                                (ckpt.pos_min == 0 || ckpt.pos_min < min_needed);
+                                        });
+                                    n_past = 0;
+                                    if (it != slot.prompt.checkpoints.rend()) {
+                                        bool loaded = it->load_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) &&
+                                                      it->load_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                                        if (loaded) {
+                                            const llama_pos next = slot.prompt.tokens.pos_next(it->n_tokens);
+                                            const llama_pos min_needed = std::max(0, n_swa > 0 ? next - n_swa + 2 : next);
+                                            const llama_pos actual_min = llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot.id);
+                                            const llama_pos actual_max = llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id);
+                                            loaded = actual_min >= 0 && actual_max == next - 1 &&
+                                                     (actual_min == 0 || actual_min < min_needed);
+                                        }
+                                        if (!loaded) {
+                                            SLT_WRN(slot, "%s", "MTP checkpoint is incompatible; reprocessing the full prompt\n");
+                                            slot.prompt_clear();
+                                        } else {
+                                            common_speculative_set_state(spec.get(), slot.id, it->data_spec);
+                                            n_past = (int) it->n_tokens;
+                                        }
+                                    }
+                                }
+                            }
                             llama_pos pos_next = slot.prompt.tokens.pos_next(n_past);
 
                             // number of cached tokens shared with the new prompt, before any checkpoint is restored
@@ -4249,7 +4376,8 @@ private:
                                     SLT_WRN(slot, "%s\n", st1.str().c_str());
                                 }
 
-                                if (pos_min >= pos_min_thold) {
+                                // MTP already selected and validated the checkpoint above.
+                                if (!has_mtp() && pos_min >= pos_min_thold) {
                                     // search for a context checkpoint
                                     const auto it = std::find_if(
                                         slot.prompt.checkpoints.rbegin(),
@@ -4315,7 +4443,7 @@ private:
                         // [TAG_PROMPT_LOGITS]
                         if (n_past == slot.task->n_tokens() && n_past > 0) {
                             SLT_WRN(slot, "need to evaluate at least 1 token for each active slot (n_past = %d, task.n_tokens() = %d)\n", n_past, slot.task->n_tokens());
-                            n_past--;
+                            n_past = has_mtp() ? 0 : n_past - 1;
                             SLT_WRN(slot, "n_past was set to %d\n", n_past);
                         }
 
@@ -4366,7 +4494,7 @@ private:
                             }
                             if (is_shared_done) {
                                 SLT_TRC(slot, " - copying shared prompt (%d tokens) to child %d\n", slot.prompt.n_tokens(), other.id);
-                                slot.copy_prompt_to(other);
+                                slot.copy_prompt_to(other, has_mtp());
                                 other.state = SLOT_STATE_STARTED;
                             } else {
                                 wait_shared = true;
@@ -4388,7 +4516,7 @@ private:
                         alora_disabled_id = enabled_loras[0];
                     }
 
-                    bool do_checkpoint = params_base.n_ctx_checkpoints > 0;
+                    bool do_checkpoint = params_base.n_ctx_checkpoints > 0 && !has_shared_mtp();
 
                     // make checkpoints only for completion tasks
                     do_checkpoint = do_checkpoint && slot.task->type == SERVER_TASK_TYPE_COMPLETION;
@@ -4436,6 +4564,9 @@ private:
 
                         if (res != 0) {
                             SLT_ERR(slot, "failed to process mtmd chunk, res = %d\n", res);
+                            if (!common_speculative_is_healthy(spec.get())) {
+                                throw std::runtime_error("failed to process speculative multimodal batch; restart the server");
+                            }
                             send_error(slot, "failed to process mtmd chunk", ERROR_TYPE_SERVER);
                             slot.release();
                             return; // the slot is done, skip it entirely
@@ -4761,8 +4892,7 @@ private:
             if (!ok) {
                 SRV_ERR("%s", "failed to process speculative batch\n");
 
-                // TODO: handle error
-                throw std::runtime_error("failed to process speculative batch");
+                throw std::runtime_error("failed to process speculative batch; restart the server");
             }
         }
 
@@ -4785,7 +4915,7 @@ private:
                     // children with their own prompt are started at the end of the shared prefix
                     GGML_ASSERT(slot.task->n_tokens_shared == 0);
 
-                    slot.copy_state_to(*child);
+                    slot.copy_state_to(*child, has_mtp());
                     child->state = SLOT_STATE_DONE_PROMPT;
                 }
             }
@@ -4982,6 +5112,9 @@ private:
                         if (slot.ctx_dft) {
                             GGML_ASSERT(ckpt.load_dft(slot.ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY));
                         }
+                        if (has_mtp()) {
+                            common_speculative_set_state(spec.get(), slot.id, ckpt.data_spec);
+                        }
 
                         slot.mem.seq_rm(slot.id, ckpt.pos_max + 1, -1);
 
@@ -5022,6 +5155,10 @@ private:
             for (size_t i = 0; i < n_accepted && i < n_accepted_per_pos.size(); ++i) {
                 n_accepted_per_pos[i]++;
             }
+            if (slot.n_draft_len.size() <= n_draft) {
+                slot.n_draft_len.resize(n_draft + 1, 0);
+            }
+            slot.n_draft_len[n_draft]++;
 
             // add accepted tokens to the prompt
             slot.prompt.tokens.keep_first(slot.prompt.n_tokens() - n_draft);
