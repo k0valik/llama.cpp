@@ -5090,7 +5090,10 @@ private:
 
                 const bool use_ckpt_tgt =
                     ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL ||
-                    (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS && n_rollback > llama_n_rs_seq(ctx_tgt));
+                    // Long verification batches may not retain recurrent replay rows,
+                    // even when only one or two draft tokens need to be removed.
+                    (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS &&
+                     (n_draft > llama_n_rs_seq(ctx_tgt) || n_rollback > llama_n_rs_seq(ctx_tgt)));
 
                 // check for partial draft acceptance
                 if (n_rollback > 0) {
