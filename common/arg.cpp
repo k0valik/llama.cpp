@@ -4230,6 +4230,58 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_SAMPLING"));
     add_opt(common_arg(
+        {"--spec-coupled-sampling"},
+        {"--no-spec-coupled-sampling"},
+        string_format("sample with Gumbel-max over counter-based noise and let the MTP drafter use the same noise, so drafts match\n"
+                      "the sampled tokens more often at temperature > 0 (same output distribution; default: %s)",
+                      params.sampling.coupled ? "enabled" : "disabled"),
+        [](common_params & params, bool value) {
+            params.sampling.coupled = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_COUPLED"));
+    add_opt(common_arg(
+        {"--spec-draft-vocab"}, "FNAME",
+        "MTP: draft greedily over a reduced vocabulary (token ids in FNAME, most frequent first) and run all draft\n"
+        "steps in a single graph (qwen35 MTP with flash attention only; default: disabled)",
+        [](common_params & params, const std::string & value) {
+            params.speculative.draft.vocab_file = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_VOCAB"));
+    add_opt(common_arg(
+        {"--spec-draft-vocab-n"}, "N",
+        string_format("MTP reduced vocabulary: use only the first N ids of --spec-draft-vocab (default: %d = all)", params.speculative.draft.vocab_n),
+        [](common_params & params, int value) {
+            params.speculative.draft.vocab_n = std::max(0, value);
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_VOCAB_N"));
+    add_opt(common_arg(
+        {"--spec-draft-vocab-ctx"}, "N",
+        string_format("MTP reduced vocabulary: extra rows for tokens that appear in the context (default: %d)", params.speculative.draft.vocab_ctx),
+        [](common_params & params, int value) {
+            params.speculative.draft.vocab_ctx = std::max(0, value);
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_VOCAB_CTX"));
+    add_opt(common_arg(
+        {"--spec-draft-fuse-catchup"},
+        {"--no-spec-draft-fuse-catchup"},
+        string_format("MTP reduced vocabulary: run the catch-up of the verified tokens inside the next draft graph (default: %s)",
+                      params.speculative.draft.fuse_catchup ? "enabled" : "disabled"),
+        [](common_params & params, bool value) {
+            params.speculative.draft.fuse_catchup = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_FUSE_CATCHUP"));
+    add_opt(common_arg(
+        {"--spec-draft-adaptive"},
+        {"--no-spec-draft-adaptive"},
+        string_format("MTP reduced vocabulary (--spec-draft-vocab): pick the draft length (1..--spec-draft-n-max) and how much of the\n"
+                      "draft to verify each cycle from the online acceptance (by the drafter's confidence) and the measured cycle cost\n"
+                      "(default: %s)",
+                      params.speculative.draft.adaptive ? "enabled" : "disabled"),
+        [](common_params & params, bool value) {
+            params.speculative.draft.adaptive = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_ADAPTIVE"));
+    add_opt(common_arg(
         {"--spec-draft-device", "-devd", "--device-draft"}, "<dev1,dev2,..>",
         "comma-separated list of devices to use for offloading the draft model (none = don't offload, default: follows --device)\n"
         "use --list-devices to see a list of available devices",

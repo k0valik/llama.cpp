@@ -863,6 +863,10 @@ bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, int warp_size, const
                     return ne11 <= MMVF_MAX_BATCH_SIZE;
                 }
                 if (ampere_mma_available(cc)) {
+                    // Thin matrices (e.g. Qwen3.5 ssm_alpha/ssm_beta, 48 rows) leave cuBLAS/MMF latency-bound.
+                    if (src0_ne[1] <= 256 && src0_ne[2]*src0_ne[3] == 1) {
+                        return ne11 <= MMVF_MAX_BATCH_SIZE;
+                    }
                     return src0_small && ne11 == 1;
                 }
                 if (cc >= GGML_CUDA_CC_ADA_LOVELACE) {

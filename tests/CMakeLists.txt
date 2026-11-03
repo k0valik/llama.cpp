@@ -185,6 +185,7 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     # these tests are disabled on Windows because they use internal functions not exported with LLAMA_API (when building with shared libraries)
     llama_build_and_test(test-unicode.cpp  LABEL behavior  LINK llama)
     llama_build_and_test(test-sampling.cpp  LABEL behavior  LINK llama)
+    llama_build_and_test(test-sampling-coupled.cpp  LABEL behavior)
     llama_build_and_test(test-reasoning-budget.cpp  LABEL behavior)
     llama_build_and_test(test-grammar-parser.cpp  LABEL behavior  LINK llama)
     llama_build_and_test(test-grammar-integration.cpp  LABEL behavior)
@@ -356,6 +357,8 @@ endif()
 llama_build(test-backend-ops.cpp LINK ggml Threads::Threads)
 
 llama_build_and_test(test-backend-tensor.cpp LINK ggml)
+# Rollback by replay vs recurrent-state snapshots (CUDA validation requires a GPU).
+llama_build(test-gdn-replay.cpp)
 
 llama_build_and_test(test-tiled-mulmat.cpp  LABEL "main behavior backend"  LINK ggml)
 llama_build_and_test(test-model-load-cancel.cpp LABEL "model behavior")

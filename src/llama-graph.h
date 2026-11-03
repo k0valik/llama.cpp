@@ -179,10 +179,53 @@ public:
     virtual ~llm_graph_input_batch_idxs() = default;
 
     void set_input(const llama_ubatch * ubatch) override;
-
     bool can_reuse(const llm_graph_params & params) override;
 
     ggml_tensor * idxs = nullptr; // I64 [n_batch]
+};
+
+// reduced-vocabulary greedy draft head of an MTP context (owned by llama_context)
+struct llama_mtp_draft_head {
+    ggml_tensor * head = nullptr; // [n_embd, cap] rows of the LM head (same type)
+    ggml_tensor * embd = nullptr; // [n_embd, cap] rows of the token embeddings (same type)
+    ggml_tensor * map  = nullptr; // F32 [1, cap]  row -> token id
+
+    const int32_t * slot_of = nullptr; // [n_vocab] token -> row or -1 (host)
+
+    int32_t n_used = 0; // rows holding real tokens (the rest are copies of row 0)
+
+    // Gumbel noise of the draft steps (llama_mtp_set_draft_noise)
+    uint32_t noise_seed  = 0;
+    uint32_t noise_k0    = 0;
+    float    noise_temp  = 0.0f;
+    int32_t  noise_top_k = 0;
+    float    noise_top_p = 1.0f;
+};
+
+// inputs of the MTP multi-step draft graph: only the first n_first ubatch rows carry data
+class llm_graph_input_mtp_draft : public llm_graph_input_i {
+public:
+    llm_graph_input_mtp_draft(uint32_t n_pos_per_embd, int64_t n_first, int64_t n_steps, const llama_mtp_draft_head * dh)
+        : n_pos_per_embd(n_pos_per_embd), n_first(n_first), n_steps(n_steps), dh(dh) {}
+    virtual ~llm_graph_input_mtp_draft() = default;
+
+    void set_input(const llama_ubatch * ubatch) override;
+
+    bool can_reuse(const llm_graph_params & params) override;
+
+    ggml_tensor * tokens = nullptr; // I32 [n_first]  token ids        (embeddings gathered from the model)
+    ggml_tensor * rows   = nullptr; // I32 [n_first]  draft head rows  (embeddings gathered from the head)
+    ggml_tensor * h      = nullptr; // F32 [n_embd, n_first]
+    // positions of the first n_first rows (section-major as in llm_graph_input_pos), followed by
+    // n_pos_per_embd values for each of the (n_steps - 1) draft slots
+    ggml_tensor * pos    = nullptr; // I32 [n_pos_per_embd*(n_first + n_steps - 1)]
+    ggml_tensor * rng    = nullptr; // I32 [6] parameters of ggml_add_gumbel for the draft noise (cparams.mtp_draft_noise)
+
+    const uint32_t n_pos_per_embd;
+    const int64_t  n_first;
+    const int64_t  n_steps;
+
+    const llama_mtp_draft_head * dh;
 };
 
 class llm_graph_input_pos : public llm_graph_input_i {
@@ -311,6 +354,19 @@ public:
 
     // I32 [n_slot] = {n_slot - 1, ..., 0}, rollback slot of each conv window, created by the graphs that write them
     ggml_tensor * s_slot_rev = nullptr;
+
+    // rollback by replay (llama_memory_recurrent::rs_replay): packed I32 row indices and views of it
+    ggml_tensor * rp_idx      = nullptr;
+    ggml_tensor * rp_s_src    = nullptr; // [n_seqs]         state source rows
+    ggml_tensor * rp_rep      = nullptr; // [2*n_seqs]       rows to replay, fold flag
+    ggml_tensor * rp_ring_src = nullptr; // [Cap*n_seqs]     ring source rows (pending rows first)
+    ggml_tensor * rp_s_dst    = nullptr; // [n_seqs]         state destination rows
+    ggml_tensor * rp_ring_dst = nullptr; // [n_tokens*n_seqs] ring rows of the new tokens (ubatches of <= W tokens)
+    ggml_tensor * rp_extra    = nullptr; // [n_rs - n_seqs]  source cells of the other cells in the range
+
+    // fill rp_idx / check that it can be reused
+    void set_input_replay(const llama_memory_recurrent_context * mctx_recr, const llama_ubatch * ubatch);
+    bool can_reuse_replay(const llama_memory_recurrent_context * mctx_recr, const llama_ubatch & ubatch) const;
 
     const llama_memory_recurrent_context * mctx;
 
@@ -902,6 +958,14 @@ struct llm_graph_params {
             return false;
         }
 
+        if (cparams.mtp_draft_steps != other.cparams.mtp_draft_steps ||
+            cparams.mtp_dev_embd    != other.cparams.mtp_dev_embd    ||
+            cparams.mtp_head_rows   != other.cparams.mtp_head_rows   ||
+            cparams.mtp_draft_noise != other.cparams.mtp_draft_noise ||
+            cparams.mtp_head        != other.cparams.mtp_head) {
+            return false;
+        }
+
         return
             cparams.embeddings              == other.cparams.embeddings              &&
             cparams.embeddings_nextn        == other.cparams.embeddings_nextn        &&
@@ -966,6 +1030,13 @@ public:
 
     void set_params(const llm_graph_params & params);
 
+    // the scheduler redirects node sources that live on another backend to input copies it owns (gone once it has
+    // allocated another graph) and the backends may reorder the nodes: save_srcs() keeps the node order and sources of
+    // the graph as built, restore_srcs() puts them back and drops the tensors' placement in the compute buffers, so
+    // that the graph can be allocated again after another one like a newly built graph (see llama_context::gf_res_prev)
+    void save_srcs();
+    void restore_srcs();
+
     // important graph nodes
     ggml_tensor * t_inp_tokens  = nullptr;
     ggml_tensor * t_inp_embd    = nullptr; // [n_embd_inp, n_tokens]
@@ -973,6 +1044,7 @@ public:
     ggml_tensor * t_embd        = nullptr;
     ggml_tensor * t_embd_pooled = nullptr;
     ggml_tensor * t_h_nextn     = nullptr; // [n_embd, n_outputs] hidden state before final output norm
+    ggml_tensor * t_mtp_draft   = nullptr; // F32 [3*n_steps] (token id, top-1 prob, confidence) per MTP draft step
 
     std::vector<ggml_tensor *> t_layer_inp;
 
@@ -985,6 +1057,7 @@ public:
     std::vector<llm_graph_fused_node> fused_nodes;
 
     std::map<std::pair<const ggml_tensor *, const ggml_tensor *>, ggml_tensor *> hdmd_inputs;
+    std::vector<ggml_tensor *> srcs; // [n_nodes*(1 + GGML_MAX_SRC)]: nodes, then their sources (see save_srcs())
 
     ggml_context_ptr ctx_compute;
 

@@ -21,6 +21,15 @@ struct llama_cparams {
 
     int32_t  nextn_layer_offset = 0;
 
+    // MTP greedy multi-step drafting (llama_mtp_draft_* in llama-ext.h). When mtp_draft_steps > 0 the
+    // DECODER_MTP graph treats the last (mtp_draft_steps - 1) ubatch rows as draft slots and chains
+    // mtp_draft_steps greedy steps over the first mtp_head_rows rows of the reduced draft head.
+    const struct llama_mtp_draft_head * mtp_head = nullptr;
+    int32_t  mtp_head_rows   = 0;
+    int32_t  mtp_draft_steps = 0;
+    bool     mtp_dev_embd    = false; // the first-pass tokens are all in the head: take their embeddings from it
+    bool     mtp_draft_noise = false; // add Gumbel noise before each draft argmax (llama_mtp_set_draft_noise)
+
     float rope_freq_base;
     float rope_freq_scale;
 

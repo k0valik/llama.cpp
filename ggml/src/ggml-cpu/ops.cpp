@@ -11,6 +11,8 @@
 #include <algorithm>
 #include <cfloat>
 #include <cmath>
+#include <functional>
+#include <vector>
 
 // ggml_compute_forward_dup
 
@@ -1640,6 +1642,110 @@ void ggml_compute_forward_argmax(
             {
                 GGML_ABORT("fatal error");
             }
+    }
+}
+
+// ggml_compute_forward_add_gumbel
+
+// Float-to-integer ordering must match ggml-cuda/gumbel.cu.
+static inline uint32_t ggml_gumbel_key(float x) {
+    uint32_t b;
+    memcpy(&b, &x, sizeof(b));
+    return b ^ ((b >> 31) ? 0xFFFFFFFFu : 0x80000000u);
+}
+
+void ggml_compute_forward_add_gumbel(const ggml_compute_params * params, ggml_tensor * dst) {
+    const ggml_tensor * src0 = dst->src[0];
+    const ggml_tensor * src1 = dst->src[1];
+    const ggml_tensor * src2 = dst->src[2];
+    GGML_ASSERT(src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 && src2->type == GGML_TYPE_I32);
+    GGML_ASSERT(src1->type == GGML_TYPE_I32 || src1->type == GGML_TYPE_F32);
+    if (params->ith != 0) {
+        return;
+    }
+
+    const int32_t * par = (const int32_t *) src2->data;
+    const uint32_t seed = (uint32_t) par[0];
+    const uint32_t k = (uint32_t) par[1];
+    const int32_t top_k = par[4];
+    float t, top_p;
+    memcpy(&t, &par[2], sizeof(float));
+    memcpy(&top_p, &par[5], sizeof(float));
+    const int32_t k_off = ggml_get_op_params_i32(dst, 0);
+    const int64_t n = src0->ne[0];
+    const int64_t nr = src0->ne[1];
+    const int64_t nv = par[3] > 0 ? std::min<int64_t>(par[3], n) : n;
+    const int max_cand = 128; // Keep in sync with ggml-cuda/gumbel.cu.
+    std::vector<uint32_t> keys(nv);
+    std::vector<int64_t> cand;
+
+    for (int64_t ir = 0; ir < nr; ++ir) {
+        const float * a = (const float *) ((const char *) src0->data + ir*src0->nb[1]);
+        float * y = (float *) ((char *) dst->data + ir*dst->nb[1]);
+        if (t == 0.0f) {
+            memcpy(y, a, n*sizeof(float));
+            continue;
+        }
+        // Keep all valid entries, or those up to (lkey, lidx) in value-descending, index-ascending order.
+        bool all = true;
+        uint32_t lkey = 0;
+        int64_t lidx = 0;
+        if (top_k > 0 && nv > 0) {
+            for (int64_t i = 0; i < nv; ++i) {
+                keys[i] = ggml_gumbel_key(a[i]);
+            }
+            const int64_t kk = std::min<int64_t>(top_k, nv);
+            std::vector<uint32_t> tmp(keys);
+            std::nth_element(tmp.begin(), tmp.begin() + (kk - 1), tmp.end(), std::greater<uint32_t>());
+            const uint32_t tau = tmp[kk - 1];
+            cand.clear();
+            for (int64_t i = 0; i < nv; ++i) {
+                if (keys[i] >= tau) {
+                    cand.push_back(i);
+                }
+            }
+            if ((int64_t) cand.size() <= max_cand) {
+                std::sort(cand.begin(), cand.end(), [&](int64_t x, int64_t z) {
+                    return keys[x] > keys[z] || (keys[x] == keys[z] && x < z);
+                });
+                size_t c = cand.size();
+                if (top_p < 1.0f) {
+                    std::vector<float> e(cand.size());
+                    float sum = 0.0f;
+                    for (size_t l = 0; l < cand.size(); ++l) {
+                        e[l] = (float) exp((double) a[cand[l]] - (double) a[cand[0]]);
+                        e[l] = e[l] < FLT_MIN ? 0.0f : e[l]; // as the GPU (flush to zero)
+                        sum += e[l];
+                    }
+                    const float lim = top_p*sum;
+                    float cum = 0.0f;
+                    for (size_t l = 0; l < cand.size(); ++l) {
+                        cum += e[l];
+                        if (cum >= lim) {
+                            c = l + 1;
+                            break;
+                        }
+                    }
+                }
+                all = false;
+                lkey = keys[cand[c - 1]];
+                lidx = cand[c - 1];
+            }
+        }
+        const uint32_t kr = k + (uint32_t) k_off + (uint32_t) ir;
+        for (int64_t i = 0; i < n; ++i) {
+            bool keep = i < nv;
+            if (keep && !all) {
+                const uint32_t key = ggml_gumbel_key(a[i]);
+                keep = key > lkey || (key == lkey && i <= lidx);
+            }
+            if (!keep) {
+                y[i] = -INFINITY;
+                continue;
+            }
+            const int32_t id = src1->type == GGML_TYPE_I32 ? ((const int32_t *) src1->data)[i] : (int32_t) ((const float *) src1->data)[i];
+            y[i] = fmaf(t, ggml_gumbel_noise(seed, kr, id), a[i]);
+        }
     }
 }
 
@@ -11336,6 +11442,141 @@ void ggml_compute_forward_gated_delta_net(
         case GGML_TYPE_F32:
             {
                 ggml_compute_forward_gated_delta_net_f32(params, dst);
+            } break;
+        default:
+            {
+                GGML_ABORT("fatal error");
+            }
+    }
+}
+
+// ggml_compute_forward_gated_delta_net_replay
+
+static void ggml_compute_forward_gated_delta_net_replay_f32(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const ggml_tensor * src_q     = dst->src[0];
+    const ggml_tensor * src_k     = dst->src[1];
+    const ggml_tensor * src_v     = dst->src[2];
+    const ggml_tensor * src_g     = dst->src[3];
+    const ggml_tensor * src_beta  = dst->src[4];
+    const ggml_tensor * src_state = dst->src[5];
+    const ggml_tensor * src_ring  = dst->src[6];
+    const ggml_tensor * src_rep   = dst->src[7];
+
+    const int64_t S_k      = src_k->ne[0];
+    const int64_t H_k      = src_k->ne[1];
+    const int64_t S_v      = src_v->ne[0];
+    const int64_t H        = src_v->ne[1];
+    const int64_t n_tokens = src_v->ne[2];
+    const int64_t n_seqs   = src_v->ne[3];
+    const int64_t F        = src_ring->ne[0];
+    const int64_t R        = src_ring->ne[1];
+    const int64_t W        = ggml_get_op_params_i32(dst, 0);
+    const bool    chain    = n_tokens <= W;
+    const int64_t D        = S_v*S_v*H;
+
+    GGML_TENSOR_LOCALS(size_t, nbq, src_q, nb);
+    GGML_TENSOR_LOCALS(size_t, nbk, src_k, nb);
+    GGML_TENSOR_LOCALS(size_t, nbv, src_v, nb);
+    GGML_TENSOR_LOCALS(size_t, nbg, src_g, nb);
+    GGML_TENSOR_LOCALS(size_t, nbb, src_beta, nb);
+
+    // ring row layout: k [S_k, H_k] | v [S_v, H] | g [H] | beta [H]
+    const int64_t off_v = S_k*H_k;
+    const int64_t off_g = off_v + S_v*H;
+    const int64_t off_b = off_g + H;
+
+    float * attn_base  = (float *) dst->data;
+    float * state_base = attn_base + S_v*H*n_tokens*n_seqs;
+    float * ring_out   = state_base + D*n_seqs;
+
+    const float scale = 1.0f / sqrtf((float) S_v);
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    float * delta = (float *) params->wdata + ith*(S_v + S_v*S_v + CACHE_LINE_SIZE_F32);
+    float * s     = delta + S_v; // working state
+
+    // one step of the recurrence on the transposed state s (s[j*S_v + i] = S[i][j]); q == nullptr: no output
+    auto step = [&](const float * k_d, const float * v_d, float g_val, float beta_val, const float * q_d, float * out) {
+        ggml_vec_scale_f32(S_v*S_v, s, expf(g_val));
+        for (int64_t j = 0; j < S_v; ++j) {
+            float sum = 0.0f;
+            ggml_vec_dot_f32(S_v, &sum, 0, &s[j*S_v], 0, k_d, 0, 1);
+            delta[j] = (v_d[j] - sum)*beta_val;
+        }
+        for (int64_t j = 0; j < S_v; ++j) {
+            ggml_vec_mad_f32(S_v, &s[j*S_v], k_d, delta[j]);
+        }
+        if (q_d) {
+            for (int64_t j = 0; j < S_v; ++j) {
+                float sum = 0.0f;
+                ggml_vec_dot_f32(S_v, &sum, 0, &s[j*S_v], 0, q_d, 0, 1);
+                out[j] = sum*scale;
+            }
+        }
+    };
+
+    const int64_t nr = H*n_seqs;
+    for (int64_t ir = ith; ir < nr; ir += nth) {
+        const int64_t h   = ir % H;
+        const int64_t seq = ir / H;
+        const int64_t kh  = h % H_k;
+
+        float * s_out = state_base + seq*D + h*S_v*S_v;
+        memcpy(s, (const char *) src_state->data + seq*src_state->nb[3] + h*S_v*S_v*sizeof(float), S_v*S_v*sizeof(float));
+
+        const int32_t n_rep = ((const int32_t *) src_rep->data)[2*seq + 0];
+        const int32_t fold  = ((const int32_t *) src_rep->data)[2*seq + 1];
+        GGML_ASSERT(n_rep >= 0 && n_rep <= R);
+
+        if (chain && !fold) {
+            memcpy(s_out, s, S_v*S_v*sizeof(float));
+        }
+        for (int64_t t = 0; t < n_rep; ++t) {
+            const float * row = (const float *) ((const char *) src_ring->data + seq*src_ring->nb[2] + t*src_ring->nb[1]);
+            step(row + kh*S_k, row + off_v + h*S_v, row[off_g + h], row[off_b + h], nullptr, nullptr);
+        }
+        if (chain && fold) {
+            memcpy(s_out, s, S_v*S_v*sizeof(float));
+        }
+
+        float * attn = attn_base + (seq*n_tokens*H + h)*S_v;
+        for (int64_t t = 0; t < n_tokens; ++t) {
+            const float * q_d = (const float *) ((const char *) src_q->data + seq*nbq3 + t*nbq2 + kh*nbq1);
+            const float * k_d = (const float *) ((const char *) src_k->data + seq*nbk3 + t*nbk2 + kh*nbk1);
+            const float * v_d = (const float *) ((const char *) src_v->data + seq*nbv3 + t*nbv2 + h*nbv1);
+            const float g_val    = *(const float *) ((const char *) src_g->data    + seq*nbg3 + t*nbg2 + h*nbg1);
+            const float beta_val = *(const float *) ((const char *) src_beta->data + seq*nbb3 + t*nbb2 + h*nbb1);
+
+            if (chain) {
+                float * row = ring_out + (seq*n_tokens + t)*F;
+                if (h < H_k) {
+                    memcpy(row + h*S_k, k_d, S_k*sizeof(float));
+                }
+                memcpy(row + off_v + h*S_v, v_d, S_v*sizeof(float));
+                row[off_g + h] = g_val;
+                row[off_b + h] = beta_val;
+            }
+
+            step(k_d, v_d, g_val, beta_val, q_d, attn);
+            attn += S_v*H;
+        }
+        if (!chain) {
+            memcpy(s_out, s, S_v*S_v*sizeof(float));
+        }
+    }
+}
+
+void ggml_compute_forward_gated_delta_net_replay(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    switch (dst->src[0]->type) {
+        case GGML_TYPE_F32:
+            {
+                ggml_compute_forward_gated_delta_net_replay_f32(params, dst);
             } break;
         default:
             {

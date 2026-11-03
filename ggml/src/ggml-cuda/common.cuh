@@ -1452,10 +1452,37 @@ struct ggml_cuda_stream_context {
     }
 };
 
+// Per-graph cache of q8_1-quantized mat-vec activations (see ggml_cuda_q8_cache_* in ggml-cuda.cu):
+// several MMVQ mul_mats that share src1 quantize it only once, and fused producers can write it directly.
+struct ggml_cuda_q8_cache {
+    static constexpr int    n_slots    = 8;
+    static constexpr size_t slot_bytes = 8 * 32768 / 32 * 36; // 8 columns of up to 32768 values
+
+    struct entry {
+        const void * data  = nullptr; // src1 data (f32, contiguous, 2D)
+        int64_t      ne0   = 0;
+        int64_t      ne1   = 0;
+        uint64_t     stamp = 0;
+    };
+
+    char *   buf     = nullptr;
+    bool     enabled = false; // only inside graph evaluation on the main stream
+    uint64_t clock   = 0;
+    entry    e[n_slots];
+
+    void clear() {
+        for (entry & x : e) {
+            x = entry();
+        }
+    }
+};
+
 struct ggml_backend_cuda_context {
     int device;
     std::string name;
     cudaEvent_t copy_event = nullptr;
+
+    ggml_cuda_q8_cache q8_cache;
 
     cudaStream_t streams[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = {};
     cublasHandle_t cublas_handles[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = {};
@@ -1711,9 +1738,10 @@ template<typename Kernel, typename... Args>
 static __inline__ void ggml_cuda_kernel_launch(Kernel kernel, const ggml_cuda_kernel_launch_params & launch_params, Args&&... args) {
 #if defined(GGML_CUDA_USE_PDL)
 
+    // Default off: early-launched dependents can compete with memory-bound kernels for SM slots.
     static const bool env_pdl_enabled = []() {
         const char * env = getenv("GGML_CUDA_PDL");
-        return env == nullptr || std::atoi(env) != 0;
+        return env != nullptr && std::atoi(env) != 0;
     }();
 
     if (env_pdl_enabled && ggml_cuda_kernel_can_use_pdl(reinterpret_cast<const void *>(kernel))) {

@@ -823,3 +823,203 @@ void ggml_cuda_op_l2_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 
     l2_norm_f32_cuda(src0_d, dst_d, ne00, ne01, ne02, ne03, s01, s02, s03, eps, stream);
 }
+
+// Fused [add ->] rms_norm -> mul [-> q8_1] for rows of up to block_size*npt values: one block per row keeps the
+// row in registers; the optional q8_1 output uses the same block layout as quantize_row_q8_1_cuda (one q8_1 block
+// per warp and step, rows padded to q8_row_blocks blocks).
+template <int block_size, int npt, bool do_add, bool do_q8>
+static __global__ void __launch_bounds__(block_size, 1)
+add_rms_norm_mul_f32(const float * a, const float * b, float * sum_out, const float * w, float * y, void * q8,
+                     const int ncols, const int64_t s_a, const int64_t s_b, const int64_t s_sum, const int64_t s_y,
+                     const int64_t q8_row_blocks, const float eps) {
+    ggml_cuda_pdl_lc();
+    const int row  = blockIdx.x;
+    const int tid  = threadIdx.x;
+    const int lane = tid % WARP_SIZE;
+    const int warp = tid / WARP_SIZE;
+
+    a += row * s_a;
+    y += row * s_y;
+    if constexpr (do_add) {
+        b       += row * s_b;
+        sum_out += row * s_sum;
+    }
+
+    float wv[npt];
+#pragma unroll
+    for (int k = 0; k < npt; ++k) {
+        const int col = k * block_size + tid;
+        wv[k] = col < ncols ? w[col] : 0.0f;
+    }
+
+    ggml_cuda_pdl_sync();
+
+    float xv[npt];
+    float ss = 0.0f;
+#pragma unroll
+    for (int k = 0; k < npt; ++k) {
+        const int col = k * block_size + tid;
+        float x = 0.0f;
+        if (col < ncols) {
+            x = a[col];
+            if constexpr (do_add) {
+                x = x + b[col];
+                sum_out[col] = x;
+            }
+        }
+        xv[k] = x;
+        ss += x * x;
+    }
+
+    __shared__ float s_red[block_size / WARP_SIZE];
+    ss = warp_reduce_sum(ss);
+    if (lane == 0) {
+        s_red[warp] = ss;
+    }
+    __syncthreads();
+    ss = lane < block_size / WARP_SIZE ? s_red[lane] : 0.0f;
+    ss = warp_reduce_sum(ss);
+
+    const float scale = rsqrtf(ss / ncols + eps);
+
+#pragma unroll
+    for (int k = 0; k < npt; ++k) {
+        const int col = k * block_size + tid;
+        if (k * block_size + warp * WARP_SIZE >= ncols) {
+            break; // whole warp out of range (ncols % 32 == 0)
+        }
+        const float v = scale * xv[k] * wv[k];
+        y[col] = v;
+        if constexpr (do_q8) {
+            const float amax = warp_reduce_max<WARP_SIZE>(fabsf(v));
+            const float sum  = warp_reduce_sum<WARP_SIZE>(v);
+            const float d    = amax / 127.0f;
+            block_q8_1 * qb = (block_q8_1 *) q8 + row * q8_row_blocks + col / QK8_1;
+            qb->qs[lane] = amax == 0.0f ? 0 : roundf(v / d);
+            if (lane == 0) {
+                qb->ds = make_half2(d, sum);
+            }
+        }
+    }
+}
+
+// Few-row variant without inter-block communication: every block redundantly reduces the whole row (an L2-resident
+// re-read) and then normalizes only its own segment. Requires that no output aliases a or b.
+template <int block_size, int seg_cols, bool do_add, bool do_q8>
+static __global__ void __launch_bounds__(block_size, 1)
+add_rms_norm_mul_seg_f32(const float * a, const float * b, float * sum_out, const float * w, float * y, void * q8,
+                         const int ncols, const int64_t s_a, const int64_t s_b, const int64_t s_sum, const int64_t s_y,
+                         const int64_t q8_row_blocks, const float eps) {
+    constexpr int npt = seg_cols / block_size;
+    ggml_cuda_pdl_lc();
+    const int row  = blockIdx.y;
+    const int seg0 = blockIdx.x * seg_cols;
+    const int tid  = threadIdx.x;
+    const int lane = tid % WARP_SIZE;
+    const int warp = tid / WARP_SIZE;
+
+    a += row * s_a;
+    y += row * s_y;
+    if constexpr (do_add) {
+        b       += row * s_b;
+        sum_out += row * s_sum;
+    }
+
+    float wv[npt];
+#pragma unroll
+    for (int k = 0; k < npt; ++k) {
+        wv[k] = w[seg0 + k * block_size + tid];
+    }
+
+    ggml_cuda_pdl_sync();
+
+    float ss = 0.0f;
+    for (int col = tid; col < ncols; col += block_size) {
+        float x = a[col];
+        if constexpr (do_add) {
+            x = x + b[col];
+        }
+        ss += x * x;
+    }
+
+    __shared__ float s_red[block_size / WARP_SIZE];
+    ss = warp_reduce_sum(ss);
+    if (lane == 0) {
+        s_red[warp] = ss;
+    }
+    __syncthreads();
+    ss = lane < block_size / WARP_SIZE ? s_red[lane] : 0.0f;
+    ss = warp_reduce_sum(ss);
+
+    const float scale = rsqrtf(ss / ncols + eps);
+
+#pragma unroll
+    for (int k = 0; k < npt; ++k) {
+        const int col = seg0 + k * block_size + tid;
+        float x = a[col];
+        if constexpr (do_add) {
+            x = x + b[col];
+            sum_out[col] = x;
+        }
+        const float v = scale * x * wv[k];
+        y[col] = v;
+        if constexpr (do_q8) {
+            const float amax = warp_reduce_max<WARP_SIZE>(fabsf(v));
+            const float sum  = warp_reduce_sum<WARP_SIZE>(v);
+            const float d    = amax / 127.0f;
+            block_q8_1 * qb = (block_q8_1 *) q8 + row * q8_row_blocks + col / QK8_1;
+            qb->qs[lane] = amax == 0.0f ? 0 : roundf(v / d);
+            if (lane == 0) {
+                qb->ds = make_half2(d, sum);
+            }
+        }
+    }
+}
+
+bool ggml_cuda_add_rms_norm_mul(ggml_backend_cuda_context & ctx, const float * a, const float * b, float * sum_out,
+                                const float * w, float * y, void * q8, const int ncols, const int nrows,
+                                const int64_t s_a, const int64_t s_b, const int64_t s_sum, const int64_t s_y,
+                                const int64_t q8_row_blocks, const float eps, const bool no_alias) {
+    if (ncols % WARP_SIZE != 0 || ncols > 8192 || ncols < 1024 || nrows < 1) {
+        return false;
+    }
+    if (nrows <= 8 && ncols % 512 == 0 && no_alias) {
+        const ggml_cuda_kernel_launch_params lp = ggml_cuda_kernel_launch_params(dim3(ncols / 512, nrows), dim3(256), 0, ctx.stream());
+        auto launch_seg = [&](auto ADD, auto Q8) {
+            ggml_cuda_kernel_launch(add_rms_norm_mul_seg_f32<256, 512, decltype(ADD)::value, decltype(Q8)::value>, lp,
+                a, b, sum_out, w, y, q8, ncols, s_a, s_b, s_sum, s_y, q8_row_blocks, eps);
+        };
+        if (b != nullptr) {
+            if (q8) { launch_seg(std::true_type{}, std::true_type{}); } else { launch_seg(std::true_type{}, std::false_type{}); }
+        } else {
+            if (q8) { launch_seg(std::false_type{}, std::true_type{}); } else { launch_seg(std::false_type{}, std::false_type{}); }
+        }
+        return true;
+    }
+    const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(dim3(nrows), dim3(1024), 0, ctx.stream());
+    auto launch = [&](auto NPT, auto ADD, auto Q8) {
+        constexpr int  kNPT = decltype(NPT)::value;
+        constexpr bool kAdd = decltype(ADD)::value;
+        constexpr bool kQ8  = decltype(Q8)::value;
+        ggml_cuda_kernel_launch(add_rms_norm_mul_f32<1024, kNPT, kAdd, kQ8>, launch_params,
+            a, b, sum_out, w, y, q8, ncols, s_a, s_b, s_sum, s_y, q8_row_blocks, eps);
+    };
+    auto launch_npt = [&](auto NPT) {
+        if (b != nullptr) {
+            if (q8) { launch(NPT, std::true_type{}, std::true_type{}); } else { launch(NPT, std::true_type{}, std::false_type{}); }
+        } else {
+            if (q8) { launch(NPT, std::false_type{}, std::true_type{}); } else { launch(NPT, std::false_type{}, std::false_type{}); }
+        }
+    };
+    const int npt = (ncols + 1023) / 1024;
+    switch (npt) {
+        case 1:  launch_npt(std::integral_constant<int, 1>{}); break;
+        case 2:  launch_npt(std::integral_constant<int, 2>{}); break;
+        case 3:
+        case 4:  launch_npt(std::integral_constant<int, 4>{}); break;
+        case 5:  launch_npt(std::integral_constant<int, 5>{}); break;
+        case 6:  launch_npt(std::integral_constant<int, 6>{}); break;
+        default: launch_npt(std::integral_constant<int, 8>{}); break;
+    }
+    return true;
+}

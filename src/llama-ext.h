@@ -150,6 +150,30 @@ LLAMA_API bool llama_batch_ext_set_decision_order(struct llama_batch_ext * batch
 // Label of option i of a decision model ("<arch>.decision.labels"), nullptr past the last one
 LLAMA_API const char * llama_model_decision_label(const struct llama_model * model, uint32_t i);
 
+// Greedy MTP drafting over a reduced-vocabulary draft head (currently: qwen35 MTP contexts with flash attention).
+//
+// llama_mtp_draft_head_init: build the head from the rows of the given token ids (the "static" set) with room
+//   for n_capacity rows in total (>= n_ids). Returns the number of rows in use, or -1 if unsupported (no change).
+// llama_mtp_draft_head_add: append rows for tokens not yet in the head while capacity lasts (e.g. tokens seen in
+//   the context). Returns the number of rows added. llama_mtp_draft_head_reset drops them again.
+// llama_mtp_set_draft_steps: n_steps > 0 makes subsequent decode calls run n_steps chained greedy draft
+//   steps in a single graph. The batch must contain one sequence with consecutive positions in a single ubatch;
+//   its first (n_tokens - n_steps + 1) rows are real (token, h) inputs whose K/V are stored, the remaining rows are
+//   draft slots whose tokens/embeddings are ignored. 0 restores normal decoding.
+// llama_mtp_get_draft: synchronizes and returns the drafted tokens, their top-1 probabilities (over the head) and
+//   confidences (the pick's softmax share of the noise-perturbed head logits; = the probability without draft noise).
+LLAMA_API int32_t llama_mtp_draft_head_init(struct llama_context * ctx, const llama_token * ids, int32_t n_ids, int32_t n_capacity);
+LLAMA_API int32_t llama_mtp_draft_head_add (struct llama_context * ctx, const llama_token * ids, int32_t n_ids);
+LLAMA_API int32_t llama_mtp_draft_head_n_free(struct llama_context * ctx); // rows left for llama_mtp_draft_head_add
+LLAMA_API void    llama_mtp_draft_head_reset (struct llama_context * ctx); // drop the rows added after init
+LLAMA_API void    llama_mtp_set_draft_steps(struct llama_context * ctx, int32_t n_steps);
+LLAMA_API int32_t llama_mtp_get_draft      (struct llama_context * ctx, llama_token * tokens, float * probs, float * confs, int32_t n_max);
+// llama_mtp_set_draft_noise: temp > 0 makes draft step j of the following draft decodes pick
+//   argmax_r(logit_r + temp*ggml_gumbel_noise(seed, k0 + j, token_r)) over the head rows kept by top_k (0 = all, at most
+//   128) and then top_p, like the samplers of the same name (coupled sampling, see ggml_add_gumbel). temp <= 0 restores
+//   the plain argmax.
+LLAMA_API void    llama_mtp_set_draft_noise(struct llama_context * ctx, uint32_t seed, uint32_t k0, float temp, int32_t top_k, float top_p);
+
 // mirrors:
 // LLAMA_API float * llama_get_embeddings(struct llama_context * ctx);
 LLAMA_API float * llama_get_embeddings_nextn(struct llama_context * ctx);

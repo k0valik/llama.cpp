@@ -66,8 +66,16 @@ int main(int argc, char ** argv) {
     llama_context * ctx_dft = params.speculative.draft.ctx_dft;
 
     // check if the context supports partial sequence removal
-    const bool use_ckpt_tgt = common_context_can_seq_rm(ctx_tgt) == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
-    const bool use_ckpt_dft = common_context_can_seq_rm(ctx_dft) == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
+    const auto rm_tgt = common_context_can_seq_rm(ctx_tgt);
+    const auto rm_dft = common_context_can_seq_rm(ctx_dft);
+    const bool use_ckpt_tgt = rm_tgt == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
+    const bool use_ckpt_dft = rm_dft == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
+    const bool mtp = std::find(params.speculative.types.begin(), params.speculative.types.end(),
+            COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end();
+    if (mtp && (rm_tgt != COMMON_CONTEXT_SEQ_RM_TYPE_PART || rm_dft != COMMON_CONTEXT_SEQ_RM_TYPE_PART)) {
+        LOG_ERR("%s", "MTP in speculative-simple requires unrestricted partial rollback; checkpoint state is not supported\n");
+        return 1;
+    }
 
     if (use_ckpt_tgt) {
         LOG_INF("speculative decoding will use checkpoints (context does not support partial sequence removal)\n");
@@ -193,7 +201,12 @@ int main(int argc, char ** argv) {
                 /* .prompt     = */ &prompt_tgt,
                 /* .result     = */ &draft, // output
             };
-            common_speculative_draft(spec);
+            if (!common_speculative_draft_checked(spec)) {
+                LOG_ERR("%s", "failed to generate speculative draft\n");
+                common_speculative_free(spec);
+                llama_backend_free();
+                return 1;
+            }
 
             // save a checkpoint of the target context before evaluating the draft
             // this allows us to restore the state if partial draft acceptance occurs

@@ -1,4 +1,5 @@
 #include "quantize.cuh"
+#include "unary.cuh"
 #include <cstdint>
 
 #if defined(BLACKWELL_MMA_AVAILABLE)
@@ -554,6 +555,221 @@ static __global__ void quantize_mmq_q8_1(
         }
     }
     GGML_UNUSED(n_expert_used);
+}
+
+// Fused silu(a)*b -> MMQ q8_1 (prefill SwiGLU / gated activations feeding a quantized matmul): same layout and
+// numerics as silu(a)*b written as float (unary_gated_op_kernel) followed by quantize_mmq_q8_1.
+// a and b are row-major with row strides s_a/s_b (floats); rows are the tokens (ne1), ne00 values per row, ne0 padded.
+template <mmq_q8_1_ds_layout ds_layout>
+static __global__ void quantize_mmq_q8_1_silu_mul(
+        const float * __restrict__ a, const float * __restrict__ b, void * __restrict__ vy,
+        const int64_t ne00, const int64_t s_a, const int64_t s_b, const int64_t ne0, const int ne1) {
+
+    constexpr int vals_per_scale = ds_layout == MMQ_Q8_1_DS_LAYOUT_D2S6 ? 64 : 32;
+    constexpr int vals_per_sum   = ds_layout == MMQ_Q8_1_DS_LAYOUT_D2S6 ? 16 : 32;
+
+    const int64_t i0 = ((int64_t)blockDim.x*blockIdx.y + threadIdx.x)*4;
+
+    if (i0 >= ne0) {
+        return;
+    }
+
+    ggml_cuda_pdl_sync();
+
+    block_q8_1_mmq * y = (block_q8_1_mmq *) vy;
+
+    const int64_t k_block = i0 / QK8_1_MMQ; // column block in the channel
+    const int64_t iqs     = i0 % QK8_1_MMQ; // quant index in block
+
+    float4 xi = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    if (i0 < ne00) {
+        const float4 av = *((const float4 *) (a + blockIdx.x*s_a + i0));
+        const float4 bv = *((const float4 *) (b + blockIdx.x*s_b + i0));
+        xi.x = ggml_cuda_op_silu_single(av.x) * bv.x;
+        xi.y = ggml_cuda_op_silu_single(av.y) * bv.y;
+        xi.z = ggml_cuda_op_silu_single(av.z) * bv.z;
+        xi.w = ggml_cuda_op_silu_single(av.w) * bv.w;
+    }
+    float amax = fabsf(xi.x);
+    amax = fmaxf(amax, fabsf(xi.y));
+    amax = fmaxf(amax, fabsf(xi.z));
+    amax = fmaxf(amax, fabsf(xi.w));
+
+#pragma unroll
+    for (int offset = vals_per_scale/8; offset > 0; offset >>= 1) {
+        amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFF, amax, offset, WARP_SIZE));
+    }
+
+    float sum;
+    if (ds_layout != MMQ_Q8_1_DS_LAYOUT_D4) {
+        sum = xi.x + xi.y + xi.z + xi.w;
+#pragma unroll
+        for (int offset = vals_per_sum/8; offset > 0; offset >>= 1) {
+            sum += __shfl_xor_sync(0xFFFFFFFF, sum, offset, WARP_SIZE);
+        }
+    }
+
+    const float d_inv = 127.0f / amax;
+    char4 q;
+    q.x = roundf(xi.x*d_inv);
+    q.y = roundf(xi.y*d_inv);
+    q.z = roundf(xi.z*d_inv);
+    q.w = roundf(xi.w*d_inv);
+    const float d = 1.0f / d_inv;
+
+    const int64_t ib = k_block*ne1 + blockIdx.x;
+
+    char4 * yqs4 = (char4 *) y[ib].qs;
+    yqs4[iqs/4] = q;
+
+    if (ds_layout == MMQ_Q8_1_DS_LAYOUT_D2S6) {
+        if (iqs % 16 == 0 && iqs < 96) {
+            y[ib].d2s6[2 + iqs/16] = sum;
+            if (iqs % 64 == 0) {
+                y[ib].d2s6[iqs/64] = d;
+            }
+        }
+    } else if (iqs % 32 == 0) {
+        if (ds_layout == MMQ_Q8_1_DS_LAYOUT_DS4) {
+            y[ib].ds4[iqs/32] = make_half2(d, sum);
+        } else {
+            y[ib].d4[iqs/32]  = d;
+        }
+    }
+}
+
+void quantize_mmq_q8_1_silu_mul_cuda(
+        const float * a, const float * b, void * vy, const ggml_type type_src0,
+        const int64_t ne00, const int64_t s_a, const int64_t s_b, const int64_t ne0, const int64_t ne1, cudaStream_t stream) {
+    GGML_ASSERT(ne00 % 4 == 0 && s_a % 4 == 0 && s_b % 4 == 0);
+    GGML_ASSERT(ne0 % QK8_1_MMQ == 0);
+
+    const int64_t block_num_y = (ne0 + 4*CUDA_QUANTIZE_BLOCK_SIZE_MMQ - 1) / (4*CUDA_QUANTIZE_BLOCK_SIZE_MMQ);
+    const dim3 num_blocks(ne1, block_num_y, 1);
+    const dim3 block_size(CUDA_QUANTIZE_BLOCK_SIZE_MMQ, 1, 1);
+    switch (mmq_get_q8_1_ds_layout(type_src0)) {
+        case MMQ_Q8_1_DS_LAYOUT_D4:
+            quantize_mmq_q8_1_silu_mul<MMQ_Q8_1_DS_LAYOUT_D4><<<num_blocks, block_size, 0, stream>>>(a, b, vy, ne00, s_a, s_b, ne0, (int) ne1);
+            break;
+        case MMQ_Q8_1_DS_LAYOUT_DS4:
+            quantize_mmq_q8_1_silu_mul<MMQ_Q8_1_DS_LAYOUT_DS4><<<num_blocks, block_size, 0, stream>>>(a, b, vy, ne00, s_a, s_b, ne0, (int) ne1);
+            break;
+        case MMQ_Q8_1_DS_LAYOUT_D2S6:
+            quantize_mmq_q8_1_silu_mul<MMQ_Q8_1_DS_LAYOUT_D2S6><<<num_blocks, block_size, 0, stream>>>(a, b, vy, ne00, s_a, s_b, ne0, (int) ne1);
+            break;
+        default:
+            GGML_ABORT("fatal error");
+            break;
+    }
+}
+
+// Fused rms_norm(o)*w * silu(z) -> MMQ q8_1 (Qwen3.5 gated delta net output norm feeding ssm_out in prefill).
+// The rms norm groups are the 128 value blocks of the MMQ layout, one warp per group. The sum of squares, the scale and
+// the products are evaluated in the same order as rms_norm_f32<256, do_multiply> + unary_gated_op_kernel (bit-identical).
+template <mmq_q8_1_ds_layout ds_layout>
+static __global__ void quantize_mmq_q8_1_rms_silu_mul(
+        const float * __restrict__ o, const float * __restrict__ w, const float * __restrict__ z, void * __restrict__ vy,
+        const float eps, const int64_t ne00, const int64_t ne0, const int ne1) {
+    static_assert(ds_layout != MMQ_Q8_1_DS_LAYOUT_D2S6, "unsupported layout");
+
+    const int64_t i0 = ((int64_t)blockDim.x*blockIdx.y + threadIdx.x)*4;
+
+    if (i0 >= ne0) {
+        return; // whole warps: ne0 % 128 == 0
+    }
+
+    ggml_cuda_pdl_sync();
+
+    block_q8_1_mmq * y = (block_q8_1_mmq *) vy;
+
+    const int64_t k_block = i0 / QK8_1_MMQ; // column block in the channel
+    const int64_t iqs     = i0 % QK8_1_MMQ; // quant index in block
+    const int     lane    = threadIdx.x % WARP_SIZE;
+
+    float4 xi = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    if (k_block*QK8_1_MMQ < ne00) {
+        const float * og = o + blockIdx.x*ne00 + k_block*QK8_1_MMQ; // rms norm group of this warp
+        // Same summation order as rms_norm_f32<256>, the unfused kernel for 128 columns: one warp sum per 32 values (the
+        // butterfly result of lane 0), then (s0 + s2) + (s1 + s3) from the second butterfly over the 8 warp sums.
+        static_assert(QK8_1_MMQ == 4*WARP_SIZE, "bad rms norm group");
+        float s[QK8_1_MMQ/WARP_SIZE];
+#pragma unroll
+        for (int c = 0; c < QK8_1_MMQ/WARP_SIZE; ++c) {
+            const float v = og[c*WARP_SIZE + lane];
+            s[c] = __shfl_sync(0xFFFFFFFF, warp_reduce_sum<WARP_SIZE>(v * v), 0, WARP_SIZE);
+        }
+        const float tmp   = (s[0] + s[2]) + (s[1] + s[3]);
+        const float mean  = tmp / QK8_1_MMQ;
+        const float scale = rsqrtf(mean + eps);
+
+        const float4 ov = *((const float4 *) (og + iqs));
+        const float4 wv = *((const float4 *) (w  + iqs));
+        const float4 zv = *((const float4 *) (z + blockIdx.x*ne00 + i0));
+        xi.x = ggml_cuda_op_silu_single(zv.x) * (scale * ov.x * wv.x);
+        xi.y = ggml_cuda_op_silu_single(zv.y) * (scale * ov.y * wv.y);
+        xi.z = ggml_cuda_op_silu_single(zv.z) * (scale * ov.z * wv.z);
+        xi.w = ggml_cuda_op_silu_single(zv.w) * (scale * ov.w * wv.w);
+    }
+    float amax = fabsf(xi.x);
+    amax = fmaxf(amax, fabsf(xi.y));
+    amax = fmaxf(amax, fabsf(xi.z));
+    amax = fmaxf(amax, fabsf(xi.w));
+
+#pragma unroll
+    for (int offset = 32/8; offset > 0; offset >>= 1) {
+        amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFF, amax, offset, WARP_SIZE));
+    }
+
+    float sum;
+    if (ds_layout != MMQ_Q8_1_DS_LAYOUT_D4) {
+        sum = xi.x + xi.y + xi.z + xi.w;
+#pragma unroll
+        for (int offset = 32/8; offset > 0; offset >>= 1) {
+            sum += __shfl_xor_sync(0xFFFFFFFF, sum, offset, WARP_SIZE);
+        }
+    }
+
+    const float d_inv = 127.0f / amax;
+    char4 q;
+    q.x = roundf(xi.x*d_inv);
+    q.y = roundf(xi.y*d_inv);
+    q.z = roundf(xi.z*d_inv);
+    q.w = roundf(xi.w*d_inv);
+    const float d = 1.0f / d_inv;
+
+    const int64_t ib = k_block*ne1 + blockIdx.x;
+
+    char4 * yqs4 = (char4 *) y[ib].qs;
+    yqs4[iqs/4] = q;
+
+    if (iqs % 32 == 0) {
+        if (ds_layout == MMQ_Q8_1_DS_LAYOUT_DS4) {
+            y[ib].ds4[iqs/32] = make_half2(d, sum);
+        } else {
+            y[ib].d4[iqs/32]  = d;
+        }
+    }
+}
+
+bool quantize_mmq_q8_1_rms_silu_mul_cuda(
+        const float * o, const float * w, const float * z, void * vy, const ggml_type type_src0, const float eps,
+        const int64_t ne00, const int64_t ne0, const int64_t ne1, cudaStream_t stream) {
+    if (ne00 % QK8_1_MMQ != 0 || ne0 % QK8_1_MMQ != 0) {
+        return false;
+    }
+    const int64_t block_num_y = (ne0 + 4*CUDA_QUANTIZE_BLOCK_SIZE_MMQ - 1) / (4*CUDA_QUANTIZE_BLOCK_SIZE_MMQ);
+    const dim3 num_blocks(ne1, block_num_y, 1);
+    const dim3 block_size(CUDA_QUANTIZE_BLOCK_SIZE_MMQ, 1, 1);
+    switch (mmq_get_q8_1_ds_layout(type_src0)) {
+        case MMQ_Q8_1_DS_LAYOUT_D4:
+            quantize_mmq_q8_1_rms_silu_mul<MMQ_Q8_1_DS_LAYOUT_D4><<<num_blocks, block_size, 0, stream>>>(o, w, z, vy, eps, ne00, ne0, (int) ne1);
+            return true;
+        case MMQ_Q8_1_DS_LAYOUT_DS4:
+            quantize_mmq_q8_1_rms_silu_mul<MMQ_Q8_1_DS_LAYOUT_DS4><<<num_blocks, block_size, 0, stream>>>(o, w, z, vy, eps, ne00, ne0, (int) ne1);
+            return true;
+        default:
+            return false;
+    }
 }
 
 void quantize_row_q8_1_cuda(
