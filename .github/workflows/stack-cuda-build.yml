@@ -1,0 +1,203 @@
+name: Stack CUDA builds
+
+on:
+  workflow_dispatch:
+    inputs:
+      variant:
+        description: 'Source variants to build'
+        type: choice
+        options: [both, candidate, reference]
+        default: both
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  linux:
+    name: Linux CUDA - ${{ matrix.variant }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+    container: nvidia/cuda:13.1.1-devel-ubuntu24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: ${{ fromJSON(inputs.variant == 'candidate' && '["candidate"]' || inputs.variant == 'reference' && '["reference"]' || '["reference", "candidate"]') }}
+    steps:
+      - name: Install build dependencies
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends git ca-certificates build-essential cmake ninja-build
+      - name: Checkout candidate
+        if: matrix.variant == 'candidate'
+        uses: actions/checkout@v4
+        with:
+          path: source
+          fetch-depth: 0
+      - name: Checkout reference base
+        if: matrix.variant == 'reference'
+        uses: actions/checkout@v4
+        with:
+          repository: ggml-org/llama.cpp
+          ref: 4b1a27fa0eb875bbca4f6cfe936e3d65adc685c0
+          path: source
+      - name: Checkout pinned recipe
+        if: matrix.variant == 'reference'
+        uses: actions/checkout@v4
+        with:
+          repository: feveromo/recipes-qwen3.8-27b-5070ti
+          ref: 754e7adc6190b5a1861e521e1397e951140cf834
+          path: recipe
+      - name: Prepare reference patch
+        if: matrix.variant == 'reference'
+        shell: bash
+        run: |
+          set -euxo pipefail
+          echo '06606651b7d801a15f77a16526c48d0cfaa943cd39c34a7209f908057b125a94  recipe/cuda-kernels.patch' | sha256sum --check
+          git -C source apply --check ../recipe/cuda-kernels.patch
+          git -C source apply ../recipe/cuda-kernels.patch
+      - name: Configure and compile
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cmake -S source -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=120a-real \
+            -DCMAKE_INSTALL_RPATH='$ORIGIN' -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
+            -DGGML_NATIVE=OFF -DGGML_CUDA=ON -DGGML_CUDA_GRAPHS=ON \
+            -DGGML_CUDA_NCCL=OFF -DGGML_OPENMP=ON -DBUILD_SHARED_LIBS=ON \
+            -DLLAMA_OPENSSL=OFF -DLLAMA_BUILD_UI=OFF -DLLAMA_BUILD_TESTS=ON \
+            '-DGGML_CUDA_FA_QUANTS=q4_0-q4_0;q8_0-q8_0;f16-f16;bf16-bf16;q8_0-q4_0'
+          cmake --build build --parallel 2 --target llama-server llama-cli llama-bench test-backend-ops
+          for test in test-sampling-coupled test-gdn-replay; do
+            if [[ -f "source/tests/$test.cpp" ]]; then
+              cmake --build build --parallel 2 --target "$test"
+            fi
+          done
+      - name: Package binaries and provenance
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p package
+          cp -a build/bin/. package/
+          for lib in libcudart.so.13 libcublas.so.13 libcublasLt.so.13; do
+            cp -L "/usr/local/cuda/lib64/$lib" package/
+          done
+          cp source/LICENSE package/
+          {
+            echo 'variant=${{ matrix.variant }}'
+            echo 'workflow_commit=${{ github.sha }}'
+            echo "source_commit=$(git -C source rev-parse HEAD)"
+            echo 'reference_recipe_commit=754e7adc6190b5a1861e521e1397e951140cf834'
+            echo 'reference_patch_sha256=06606651b7d801a15f77a16526c48d0cfaa943cd39c34a7209f908057b125a94 (reference only)'
+            echo 'runtime_tests=not run; hosted runners have no target GPU'
+            nvcc --version
+            cmake --version
+            c++ --version
+          } > package/BUILD-INFO.txt
+          cp build/CMakeCache.txt package/
+          tar -czf "stack-linux-cuda13-${{ matrix.variant }}.tar.gz" -C package .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: stack-linux-cuda13-${{ matrix.variant }}
+          path: stack-linux-cuda13-${{ matrix.variant }}.tar.gz
+          if-no-files-found: error
+          retention-days: 7
+
+  windows:
+    name: Windows CUDA - ${{ matrix.variant }}
+    runs-on: windows-2022
+    timeout-minutes: 240
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: ${{ fromJSON(inputs.variant == 'candidate' && '["candidate"]' || inputs.variant == 'reference' && '["reference"]' || '["reference", "candidate"]') }}
+    steps:
+      - name: Use LF for source checkouts
+        shell: pwsh
+        run: git config --global core.autocrlf false
+      - name: Checkout workflow support
+        uses: actions/checkout@v4
+        with:
+          path: workflow-source
+      - name: Checkout candidate
+        if: matrix.variant == 'candidate'
+        uses: actions/checkout@v4
+        with:
+          path: source
+          fetch-depth: 0
+      - name: Checkout reference base
+        if: matrix.variant == 'reference'
+        uses: actions/checkout@v4
+        with:
+          repository: ggml-org/llama.cpp
+          ref: 4b1a27fa0eb875bbca4f6cfe936e3d65adc685c0
+          path: source
+      - name: Checkout pinned recipe
+        if: matrix.variant == 'reference'
+        uses: actions/checkout@v4
+        with:
+          repository: feveromo/recipes-qwen3.8-27b-5070ti
+          ref: 754e7adc6190b5a1861e521e1397e951140cf834
+          path: recipe
+      - name: Prepare reference patch
+        if: matrix.variant == 'reference'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $patch = (Resolve-Path recipe/cuda-kernels.patch).Path
+          if ((Get-FileHash $patch -Algorithm SHA256).Hash -ne '06606651b7d801a15f77a16526c48d0cfaa943cd39c34a7209f908057b125a94') { throw 'Unexpected patch digest' }
+          git -C source apply --check $patch
+          if ($LASTEXITCODE -ne 0) { throw 'Patch check failed' }
+          git -C source apply $patch
+          if ($LASTEXITCODE -ne 0) { throw 'Patch application failed' }
+      - name: Install CUDA 13.1
+        uses: ./workflow-source/.github/actions/windows-setup-cuda
+        with:
+          cuda_version: '13.1'
+          cuda_arch: x64
+      - name: Configure and compile
+        shell: cmd
+        run: |
+          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x64
+          if errorlevel 1 exit /b 1
+          cmake -S source -B build -G Ninja ^
+            -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=120a-real ^
+            -DGGML_NATIVE=OFF -DGGML_CUDA=ON -DGGML_CUDA_GRAPHS=ON ^
+            -DGGML_CUDA_NCCL=OFF -DGGML_OPENMP=ON -DBUILD_SHARED_LIBS=ON ^
+            -DLLAMA_OPENSSL=OFF -DLLAMA_BUILD_UI=OFF -DLLAMA_BUILD_TESTS=ON ^
+            "-DGGML_CUDA_FA_QUANTS=q4_0-q4_0;q8_0-q8_0;f16-f16;bf16-bf16;q8_0-q4_0"
+          if errorlevel 1 exit /b 1
+          cmake --build build --parallel 2 --target llama-server llama-cli llama-bench test-backend-ops
+          if errorlevel 1 exit /b 1
+          rem test-sampling-coupled is not registered for Windows shared-library builds.
+          if exist source\tests\test-gdn-replay.cpp cmake --build build --parallel 2 --target test-gdn-replay
+          if errorlevel 1 exit /b 1
+      - name: Package binaries and provenance
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force package | Out-Null
+          Copy-Item build/bin/* package/ -Recurse -Force
+          foreach ($pattern in @('cudart64_*.dll', 'cublas64_*.dll', 'cublasLt64_*.dll')) {
+            $files = @(Get-ChildItem "$env:CUDA_PATH/bin", "$env:CUDA_PATH/bin/x64", "$env:CUDA_PATH/lib" -Filter $pattern -File -ErrorAction SilentlyContinue)
+            if ($files.Count -eq 0) { throw "Missing CUDA runtime: $pattern" }
+            $files | Copy-Item -Destination package -Force
+          }
+          Copy-Item source/LICENSE, build/CMakeCache.txt package/
+          @(
+            'variant=${{ matrix.variant }}'
+            'workflow_commit=${{ github.sha }}'
+            "source_commit=$(git -C source rev-parse HEAD)"
+            'reference_recipe_commit=754e7adc6190b5a1861e521e1397e951140cf834'
+            'reference_patch_sha256=06606651b7d801a15f77a16526c48d0cfaa943cd39c34a7209f908057b125a94 (reference only)'
+            'runtime_tests=not run; hosted runners have no target GPU'
+            (& nvcc --version | Out-String)
+            (& cmake --version | Out-String)
+          ) | Set-Content package/BUILD-INFO.txt
+          Compress-Archive -Path package/* -DestinationPath "stack-windows-cuda13-${{ matrix.variant }}.zip"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: stack-windows-cuda13-${{ matrix.variant }}
+          path: stack-windows-cuda13-${{ matrix.variant }}.zip
+          if-no-files-found: error
+          retention-days: 7
