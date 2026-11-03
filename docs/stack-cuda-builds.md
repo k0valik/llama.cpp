@@ -16,7 +16,9 @@ gh workflow run stack-cuda-build.yml --repo k0valik/llama.cpp \
   --ref port/feveromo-v0.8.0-consolidated -f variant=both
 ```
 
-Use `variant=candidate` or `variant=reference` to build only that variant for both operating systems. The default is `both`. The selected ref supplies the workflow and the candidate source; the reference always uses the pinned base and patch. Dispatching this workflow does not trigger unrelated push workflows.
+Use `variant=candidate` or `variant=reference` to build only that variant, and `platform=linux` or `platform=windows` to select an operating system; both default to `both`. The selected ref supplies the workflow and the candidate source; the reference always uses the pinned base and patch. Dispatching this workflow does not trigger unrelated push workflows.
+
+Linux builds use the CUDA driver's stub only to resolve symbols while linking on a runner without a GPU driver. It is not packaged: the target machine must provide its own compatible NVIDIA driver.
 
 ## Download and test
 
