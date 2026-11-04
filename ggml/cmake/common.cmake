@@ -100,7 +100,10 @@ function(ggml_cuda_fattn_vec_instances DIR OUT_SRCS)
     list(REMOVE_DUPLICATES FA_COMBINATIONS)
 
     string(REPLACE ";" "," FA_QUANTS_DEFINE "${FA_QUANTS}")
-    add_compile_definitions(GGML_CUDA_FA_QUANTS="${FA_QUANTS_DEFINE}")
+    # Only the CUDA backend feature report consumes the selected-list string.
+    # Keep format changes from invalidating every unrelated backend object.
+    set_property(SOURCE "${DIR}/ggml-cuda.cu" APPEND PROPERTY COMPILE_DEFINITIONS
+        "GGML_CUDA_FA_QUANTS=\"${FA_QUANTS_DEFINE}\"")
     foreach (TYPE_V IN LISTS FA_TYPES)
         foreach (TYPE_K IN LISTS FA_TYPES)
             if ("${TYPE_K}-${TYPE_V}" IN_LIST FA_COMBINATIONS)
@@ -109,7 +112,9 @@ function(ggml_cuda_fattn_vec_instances DIR OUT_SRCS)
                 set(COMPILED 0)
             endif()
             string(TOUPPER "GGML_CUDA_FA_${TYPE_K}_${TYPE_V}" COMBINATION_DEF)
-            add_compile_definitions(${COMBINATION_DEF}=${COMPILED})
+            # Only the vector dispatcher tests these per-format definitions.
+            set_property(SOURCE "${DIR}/fattn.cu" APPEND PROPERTY COMPILE_DEFINITIONS
+                ${COMBINATION_DEF}=${COMPILED})
         endforeach()
     endforeach()
 
