@@ -746,34 +746,41 @@ template<int D, int stride_tile, int nwarps, int nbatch_fa, bool is_k>
 static __device__ __forceinline__ void flash_attn_ext_f16_dequantize_tile_mixed(
         const char * const __restrict__ raw, half2 * const __restrict__ tile) {
     constexpr int row_bytes = ggml_cuda_fattn_mma_packed_row_bytes(D, 2, is_k);
-    constexpr int npairs = nbatch_fa * D/2;
+    constexpr int groups = nbatch_fa * D/8;
     constexpr int nthreads = nwarps * ggml_cuda_get_physical_warp_size();
-    for (int p = threadIdx.y * ggml_cuda_get_physical_warp_size() + threadIdx.x; p < npairs; p += nthreads) {
-        const int row = p / (D/2);
-        const int pos = 2 * (p % (D/2));
+    for (int p = threadIdx.y * ggml_cuda_get_physical_warp_size() + threadIdx.x; p < groups; p += nthreads) {
+        const int row = p / (D/8);
+        const int pos = 8 * (p % (D/8));
         const int ib = pos / 32;
-        const int i = pos % 32;
-        const int qi = i % 16;
+        const int i0 = pos % 32;
         const char * block = raw + row*row_bytes + ib*(is_k ? sizeof(block_q5_0) : sizeof(block_q4_1));
-        float v0, v1;
+        __align__(16) half2 values[4];
         if constexpr (is_k) {
             const block_q5_0 * x = (const block_q5_0 *) block;
             uint32_t qh;
             memcpy(&qh, x->qh, sizeof(qh));
-            const int q0 = ((x->qs[qi] >> (i >= 16 ? 4 : 0)) & 15) | (((qh >> i) & 1) << 4);
-            const int q1 = ((x->qs[qi + 1] >> (i >= 16 ? 4 : 0)) & 15) | (((qh >> (i + 1)) & 1) << 4);
             const float d = __half2float(x->d);
-            v0 = (q0 - 16) * d;
-            v1 = (q1 - 16) * d;
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                const int i = i0 + 2*j;
+                const int qi = i % 16;
+                const int q0 = ((x->qs[qi] >> (i >= 16 ? 4 : 0)) & 15) | (((qh >> i) & 1) << 4);
+                const int q1 = ((x->qs[qi + 1] >> (i >= 16 ? 4 : 0)) & 15) | (((qh >> (i + 1)) & 1) << 4);
+                values[j] = make_half2((q0 - 16)*d, (q1 - 16)*d);
+            }
         } else {
             const block_q4_1 * x = (const block_q4_1 *) block;
             const float2 dm = __half22float2(x->dm);
-            const int q0 = (x->qs[qi] >> (i >= 16 ? 4 : 0)) & 15;
-            const int q1 = (x->qs[qi + 1] >> (i >= 16 ? 4 : 0)) & 15;
-            v0 = q0 * dm.x + dm.y;
-            v1 = q1 * dm.x + dm.y;
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                const int i = i0 + 2*j;
+                const int qi = i % 16;
+                const int q0 = (x->qs[qi] >> (i >= 16 ? 4 : 0)) & 15;
+                const int q1 = (x->qs[qi + 1] >> (i >= 16 ? 4 : 0)) & 15;
+                values[j] = make_half2(q0*dm.x + dm.y, q1*dm.x + dm.y);
+            }
         }
-        *swizzle<stride_tile>(tile, row*stride_tile + pos/2, row) = make_half2(v0, v1);
+        ggml_cuda_memcpy_1<16>(swizzle<stride_tile>(tile, row*stride_tile + pos/2, row), values);
     }
 }
 

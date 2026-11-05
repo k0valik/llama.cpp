@@ -180,7 +180,8 @@ static bool ggml_cuda_flash_attn_ext_mma_f16_use_packed_KV(const int cc, const g
             V->type != (mixed ? GGML_TYPE_Q4_1 : GGML_TYPE_Q4_0) ||
             // Keep prefill on the existing conversion/MMA path until the tiled
             // unpacker is fast enough for larger query batches.
-            (mixed && (!GGML_CUDA_CC_IS_NVIDIA(cc) || cc < GGML_CUDA_CC_BLACKWELL || Q->ne[1] > 4)) ||
+            (mixed && (!GGML_CUDA_CC_IS_NVIDIA(cc) || cc < GGML_CUDA_CC_BLACKWELL ||
+                       (Q->ne[1] > 4 && getenv("GGML_CUDA_MIXED_TILED_PREFILL") == nullptr))) ||
             K->ne[0] != 256 || V->ne[0] != 256 || !cp_async_available(cc)) {
         return false;
     }
