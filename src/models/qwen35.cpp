@@ -752,7 +752,7 @@ void llama_model_qwen35::graph_mtp::build_draft(const llama_model & model, int *
     const int64_t n_rows  = cparams.mtp_head_rows;
 
     GGML_ASSERT(n_first >= 1);
-    GGML_ASSERT(ubatch.token && ubatch.embd);
+    GGML_ASSERT(ubatch.token && ubatch.embd_state);
     GGML_ASSERT(dh->head && dh->embd && dh->map && n_rows > 0 && n_rows <= dh->head->ne[1]);
     GGML_ASSERT(layer.wqkv == nullptr);
 
