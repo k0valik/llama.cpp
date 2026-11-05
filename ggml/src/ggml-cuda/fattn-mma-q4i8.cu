@@ -763,8 +763,10 @@ static void q4i8_launch(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
         shared_memory_limit_raised[id] = true;
     }
 
+    // The F16 kernel can also consume mixed quantized KV after the existing
+    // launch helper converts it into its already-allocated F16 scratch buffers.
     launch_fattn<Q4I8_D, ncols1, ncols2>
-        (ctx, dst, fattn_kernel, Q4I8_NWARPS, nbytes_shared, Q4I8_NBATCH, false, false, true, false, WARP_SIZE);
+        (ctx, dst, fattn_kernel, Q4I8_NWARPS, nbytes_shared, Q4I8_NBATCH, kv_f16, kv_f16, true, false, WARP_SIZE);
 }
 
 } // namespace
@@ -794,7 +796,9 @@ bool ggml_cuda_flash_attn_ext_mma_q4i8_supported(const int device, const ggml_te
         if (!ggml_cuda_flash_attn_ext_mma_f16_use_q4_0_KV(cc, dst)) {
             return false;
         }
-    } else if (K->type == GGML_TYPE_F16 && V->type == GGML_TYPE_F16) {
+    } else if ((K->type == GGML_TYPE_F16 && V->type == GGML_TYPE_F16) ||
+               (K->type == GGML_TYPE_Q5_0 && V->type == GGML_TYPE_Q4_1 &&
+                getenv("GGML_CUDA_MIXED_INT8_PREFILL") != nullptr)) {
         float max_bias      = 0.0f;
         float logit_softcap = 0.0f;
         memcpy(&max_bias,      (const float *) dst->op_params + 1, sizeof(float));
@@ -838,7 +842,7 @@ static void ggml_cuda_flash_attn_ext_mma_q4i8_switch_ncols2(ggml_backend_cuda_co
 }
 
 void ggml_cuda_flash_attn_ext_mma_q4i8(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
-    if (dst->src[1]->type == GGML_TYPE_F16) {
+    if (dst->src[1]->type != GGML_TYPE_Q4_0) {
         ggml_cuda_flash_attn_ext_mma_q4i8_switch_ncols2<true>(ctx, dst);
     } else {
         ggml_cuda_flash_attn_ext_mma_q4i8_switch_ncols2<false>(ctx, dst);
