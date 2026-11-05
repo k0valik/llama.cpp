@@ -13603,6 +13603,23 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // Mixed Q5_0 K / Q4_1 V: speculative verification and prefill shapes.
+    for (int kv : { 512, 4096 }) {
+        for (int nb : { 3, 4, 32 }) {
+            for (bool kv_view : { false, true }) {
+                test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, nb, true, false, 0, 0,
+                    GGML_PREC_F32, GGML_TYPE_Q5_0, GGML_TYPE_Q4_1, {0, 1, 2, 3}, kv_view));
+            }
+        }
+    }
+
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 32768, 3, true, false, 0, 0,
+        GGML_PREC_F32, GGML_TYPE_Q5_0, GGML_TYPE_Q4_1, {0, 1, 2, 3}, true));
+    for (int nb : {3, 32}) {
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 4096, nb, true, false, 0, 0,
+            GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0, {0, 1, 2, 3}, true));
+    }
+
     // prefill-shaped cases with long KV (nb >= 32, kv >= 1024): covers the
     // XMX/GEMM-accelerated SYCL FA path which only activates for these shapes.
     for (int kv : { 1024, 2048, }) {
@@ -14301,6 +14318,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 // Test cases for performance evaluation: should be representative of real-world use cases
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+
+    for (int kv : {4096, 32768}) {
+        for (int nb : {3, 32}) {
+            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, nb, true, false, 0, 0,
+                GGML_PREC_F32, GGML_TYPE_Q5_0, GGML_TYPE_Q4_1, {0, 1, 2, 3}, true));
+        }
+    }
 
     for (float n : {128.0f, 4096.0f, 32768.0f, 1048576.0f}) {
         test_cases.emplace_back(new test_arange(GGML_TYPE_F32, 0.0f, n, 1.0f));

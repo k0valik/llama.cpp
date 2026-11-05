@@ -169,14 +169,19 @@ bool ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(const int cc, const ggml_
 #endif // !defined(GGML_USE_MUSA)
 }
 
-bool ggml_cuda_flash_attn_ext_mma_f16_use_q4_0_KV(const int cc, const ggml_tensor * dst) {
+static bool ggml_cuda_flash_attn_ext_mma_f16_use_packed_KV(const int cc, const ggml_tensor * dst, const bool mixed) {
     const ggml_tensor * Q    = dst->src[0];
     const ggml_tensor * K    = dst->src[1];
     const ggml_tensor * V    = dst->src[2];
     const ggml_tensor * mask = dst->src[3];
 
     // The direct Q4 loader does not gather the upstream per-query KV row map.
-    if (dst->src[5] || K->type != GGML_TYPE_Q4_0 || V->type != GGML_TYPE_Q4_0 || K->ne[0] != 256 || V->ne[0] != 256 || !cp_async_available(cc)) {
+    if (dst->src[5] || K->type != (mixed ? GGML_TYPE_Q5_0 : GGML_TYPE_Q4_0) ||
+            V->type != (mixed ? GGML_TYPE_Q4_1 : GGML_TYPE_Q4_0) ||
+            // Keep prefill on the existing conversion/MMA path until the tiled
+            // unpacker is fast enough for larger query batches.
+            (mixed && (!GGML_CUDA_CC_IS_NVIDIA(cc) || cc < GGML_CUDA_CC_BLACKWELL || Q->ne[1] > 4)) ||
+            K->ne[0] != 256 || V->ne[0] != 256 || !cp_async_available(cc)) {
         return false;
     }
 
@@ -214,6 +219,14 @@ bool ggml_cuda_flash_attn_ext_mma_f16_use_q4_0_KV(const int cc, const ggml_tenso
 
     // The sparse kernels read the F16 K/V buffers.
     return !ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(cc, dst, 1, 8) && !ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(cc, dst, 8, 8);
+}
+
+bool ggml_cuda_flash_attn_ext_mma_f16_use_q4_0_KV(const int cc, const ggml_tensor * dst) {
+    return ggml_cuda_flash_attn_ext_mma_f16_use_packed_KV(cc, dst, false);
+}
+
+bool ggml_cuda_flash_attn_ext_mma_f16_use_mixed_KV(const int cc, const ggml_tensor * dst) {
+    return ggml_cuda_flash_attn_ext_mma_f16_use_packed_KV(cc, dst, true);
 }
 
 template <int DKQ, int DV, int ncols2>
@@ -853,7 +866,8 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
             need_f16_V = true;
             break;
         case BEST_FATTN_KERNEL_MMA_F16:
-            need_f16_K = !ggml_cuda_flash_attn_ext_mma_f16_use_q4_0_KV(ggml_cuda_info().devices[device].cc, dst);
+            need_f16_K = !ggml_cuda_flash_attn_ext_mma_f16_use_q4_0_KV(ggml_cuda_info().devices[device].cc, dst) &&
+                         !ggml_cuda_flash_attn_ext_mma_f16_use_mixed_KV(ggml_cuda_info().devices[device].cc, dst);
             need_f16_V = need_f16_K;
             break;
         case BEST_FATTN_KERNEL_VEC: {
