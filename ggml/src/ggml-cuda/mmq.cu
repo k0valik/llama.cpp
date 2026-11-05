@@ -382,6 +382,19 @@ void ggml_cuda_mul_mat_q(
     ggml_cuda_mul_mat_q_switch_type(ctx, args, stream, prec_src1);
 }
 
+// Match the normal MMQ launch selection and its padded, unconditional src1 loads.
+static size_t ggml_cuda_mmq_q8_padding(const ggml_tensor * src0, const int64_t ncols, const int cc, int & J) {
+    int nthreads = 0;
+    const size_t smpbo = ggml_cuda_info().devices[ggml_cuda_get_device()].smpbo;
+    J = ggml_cuda_mmq_get_J_best(src0->type, ncols, ggml_cuda_mmq_needs_fallback(src0->ne[1]),
+            cc, smpbo, GGML_PREC_Q8, &nthreads);
+    if (J == 0) {
+        return 0;
+    }
+    const size_t chunk = nthreads * sizeof(int);
+    return ((J * sizeof(block_q8_1_mmq) + chunk - 1) / chunk) * chunk;
+}
+
 // dst = src0 * (silu(a)*b): the gated activation is computed while quantizing src1 for MMQ (prefill SwiGLU etc.).
 // a, b: contiguous F32 with ne00*ne11 elements each, dst: contiguous F32 [ne01, ne11], src0 2D. Q8_1 src1 only.
 bool ggml_cuda_mul_mat_q_silu_mul(
@@ -404,10 +417,13 @@ bool ggml_cuda_mul_mat_q_silu_mul(
     cudaStream_t stream = ctx.stream();
 
     const int64_t ne10_padded = GGML_PAD(ne00, MATRIX_ROW_PADDING);
-    const bool    fallback    = ne01 % 128 != 0;
+    int J;
+    const size_t padding = ggml_cuda_mmq_q8_padding(src0, ne11, cc, J);
+    if (J == 0) {
+        return false;
+    }
 
-    const size_t nbytes_src1_q8_1 = ne11*ne10_padded * sizeof(block_q8_1_mmq)/QK8_1_MMQ +
-        ggml_cuda_mmq_get_J_max(src0->type, fallback, cc, ne11) * sizeof(block_q8_1_mmq);
+    const size_t nbytes_src1_q8_1 = ne11*ne10_padded * sizeof(block_q8_1_mmq)/QK8_1_MMQ + padding;
     ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), nbytes_src1_q8_1);
 
     quantize_mmq_q8_1_silu_mul_cuda((const float *) a->data, (const float *) b->data, src1_q8_1.get(), src0->type,
@@ -424,7 +440,7 @@ bool ggml_cuda_mul_mat_q_silu_mul(
         ne00, ne01, ne11, s01, ne11, s1,
         1, 1, 0, s12, 0,
         1, 1, 0, s12, 0,
-        ne11, ne11};
+        ne11, J};
     ggml_cuda_mul_mat_q_switch_type(ctx, args, stream, GGML_PREC_Q8);
     return true;
 }
@@ -455,11 +471,15 @@ bool ggml_cuda_mul_mat_q_shared_src1(
     cudaStream_t stream = ctx.stream();
 
     const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
-    int64_t J_max = 0;
-    for (const ggml_tensor * dst : dsts) {
-        J_max = std::max<int64_t>(J_max, ggml_cuda_mmq_get_J_max(dst->src[0]->type, dst->src[0]->ne[1] % 128 != 0, cc, ne11));
+    int J[2];
+    size_t padding = 0;
+    for (int i = 0; i < 2; ++i) {
+        padding = std::max(padding, ggml_cuda_mmq_q8_padding(dsts[i]->src[0], ne11, cc, J[i]));
+        if (J[i] == 0) {
+            return false;
+        }
     }
-    const size_t nbytes_src1_q8_1 = ne11*ne10_padded * sizeof(block_q8_1_mmq)/QK8_1_MMQ + J_max*sizeof(block_q8_1_mmq);
+    const size_t nbytes_src1_q8_1 = ne11*ne10_padded * sizeof(block_q8_1_mmq)/QK8_1_MMQ + padding;
     ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), nbytes_src1_q8_1);
 
     quantize_mmq_q8_1_cuda((const float *) src1->data, nullptr, src1_q8_1.get(), dst_a->src[0]->type, ne10,
@@ -467,7 +487,8 @@ bool ggml_cuda_mul_mat_q_shared_src1(
     CUDA_CHECK(cudaGetLastError());
 
     const int64_t s12 = ne11 * ne10_padded * sizeof(block_q8_1) / (QK8_1 * sizeof(int));
-    for (const ggml_tensor * dst : dsts) {
+    for (int i = 0; i < 2; ++i) {
+        const ggml_tensor * dst = dsts[i];
         const ggml_tensor * src0 = dst->src[0];
         const mmq_args args = {
             (const char *) src0->data, src0->type, (const int *) src1_q8_1.ptr, nullptr, nullptr, (float *) dst->data,
@@ -475,7 +496,7 @@ bool ggml_cuda_mul_mat_q_shared_src1(
             ne10, src0->ne[1], ne11, (int64_t) (src0->nb[1] / ggml_type_size(src0->type)), ne11, (int64_t) (dst->nb[1] / sizeof(float)),
             1, 1, 0, s12, 0,
             1, 1, 0, s12, 0,
-            ne11, ne11};
+            ne11, J[i]};
         ggml_cuda_mul_mat_q_switch_type(ctx, args, stream, GGML_PREC_Q8);
     }
     return true;
@@ -507,10 +528,13 @@ bool ggml_cuda_mul_mat_q_rms_silu_mul(
     cudaStream_t stream = ctx.stream();
 
     const int64_t ne10_padded = GGML_PAD(ne00, MATRIX_ROW_PADDING);
-    const bool    fallback    = ne01 % 128 != 0;
+    int J;
+    const size_t padding = ggml_cuda_mmq_q8_padding(src0, ne11, cc, J);
+    if (J == 0) {
+        return false;
+    }
 
-    const size_t nbytes_src1_q8_1 = ne11*ne10_padded * sizeof(block_q8_1_mmq)/QK8_1_MMQ +
-        ggml_cuda_mmq_get_J_max(t, fallback, cc, ne11) * sizeof(block_q8_1_mmq);
+    const size_t nbytes_src1_q8_1 = ne11*ne10_padded * sizeof(block_q8_1_mmq)/QK8_1_MMQ + padding;
     ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), nbytes_src1_q8_1);
 
     if (!quantize_mmq_q8_1_rms_silu_mul_cuda((const float *) o->data, (const float *) w->data, (const float *) z->data,
@@ -529,7 +553,7 @@ bool ggml_cuda_mul_mat_q_rms_silu_mul(
         ne00, ne01, ne11, s01, ne11, s1,
         1, 1, 0, s12, 0,
         1, 1, 0, s12, 0,
-        ne11, ne11};
+        ne11, J};
     ggml_cuda_mul_mat_q_switch_type(ctx, args, stream, GGML_PREC_Q8);
     return true;
 }
