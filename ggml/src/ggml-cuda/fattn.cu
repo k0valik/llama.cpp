@@ -200,10 +200,10 @@ static bool ggml_cuda_flash_attn_ext_mma_f16_use_packed_KV(const int cc, const g
     // The direct Q4 loader does not gather the upstream per-query KV row map.
     if (dst->src[5] || K->type != (mixed ? GGML_TYPE_Q5_0 : GGML_TYPE_Q4_0) ||
             V->type != (mixed ? GGML_TYPE_Q4_1 : GGML_TYPE_Q4_0) ||
-            // Keep prefill on the existing conversion/MMA path until the tiled
-            // unpacker is fast enough for larger query batches.
+            // Intermediate batches use packed tiles to avoid full-cache F16 scratch.
+            // Larger batches retain INT8/conversion prefill unless explicitly opted in.
             (mixed && (!GGML_CUDA_CC_IS_NVIDIA(cc) || cc < GGML_CUDA_CC_BLACKWELL ||
-                       (Q->ne[1] > 4 && getenv("GGML_CUDA_MIXED_TILED_PREFILL") == nullptr))) ||
+                       (Q->ne[1] >= 64 && getenv("GGML_CUDA_MIXED_TILED_PREFILL") == nullptr))) ||
             K->ne[0] != 256 || V->ne[0] != 256 || !cp_async_available(cc)) {
         return false;
     }
