@@ -44,23 +44,63 @@ overlap_count=$(wc -l < "$tmp/overlap")
 } >> "$SYNC_REPORT"
 
 git switch --detach "$candidate"
-for source in sync-base sync-upstream; do
-    if ! git -c core.hooksPath=/dev/null -c rerere.enabled=false merge --no-edit --no-ff "refs/remotes/$source"; then
-        {
-            printf '## Blocked: conflict merging `%s`\n\n' "$source"
-            printf 'No candidate changes from this run were pushed. Conflicting paths:\n\n```\n'
-            git diff --name-only --diff-filter=U
-            printf '```\n\nResolve semantically in an isolated worktree and push a reviewed merge. Clean hunks also need review.\n'
-        } >> "$SYNC_REPORT"
-        exit 1
-    fi
-done
-new=$(git rev-parse HEAD)
-if [ "$new" != "$candidate" ]; then
-    # A normal push is intentionally used: a concurrent writer must win, not be overwritten.
-    if ! git push origin "HEAD:refs/heads/$SYNC_BRANCH"; then
-        printf '## Blocked: push rejected\n\nThe remote may have changed; no force push was attempted. Retry after inspection.\n' >> "$SYNC_REPORT"
-        exit 1
-    fi
+if ! git merge --no-edit --no-ff "$base"; then
+    {
+        printf '## Blocked: conflict merging canonical `%s`\n\n' "$base"
+        printf 'Nothing was pushed. Conflicting paths:\n\n```text\n'
+        git diff --name-only --diff-filter=U
+        printf '```\n'
+    } >> "$SYNC_REPORT"
+    exit 1
 fi
-printf '## Result: mechanically clean, review required\n\nPublished candidate: `%s`. No build or inference tests were run by this workflow.\n' "$new" >> "$SYNC_REPORT"
+
+# First-parent order preserves upstream ancestry; never skip a blocked commit.
+# A merge commit here may bring its complete side branch along with it.
+git rev-list --first-parent --reverse "$upstream" --not HEAD > "$tmp/commits"
+applied=0
+last=''
+blocked=''
+while IFS= read -r commit; do
+    [ -n "$commit" ] || continue
+    if ! git merge --no-edit --no-ff "$commit"; then
+        blocked=$commit
+        git diff --name-only --diff-filter=U > "$tmp/conflicts"
+        # Unexpected errors must not be mistaken for a resolvable merge conflict.
+        if [ ! -s "$tmp/conflicts" ]; then
+            printf '## Blocked: merge failed without conflict paths for `%s`. Nothing was pushed; see the log.\n' "$commit" >> "$SYNC_REPORT"
+            exit 1
+        fi
+        git merge --abort
+        break
+    fi
+    applied=$((applied + 1))
+    last=$commit
+done < "$tmp/commits"
+
+new=$(git rev-parse HEAD)
+# A conflict at the first upstream commit does not publish a canonical-only merge.
+if [ "$new" != "$candidate" ] && { [ -z "$blocked" ] || [ "$applied" -gt 0 ]; }; then
+    # Never overwrite a concurrent human or automation update.
+    if ! git push origin "HEAD:refs/heads/$SYNC_BRANCH"; then
+        printf '## Blocked: push rejected\n\nNo force push was attempted; inspect the remote before retrying.\n' >> "$SYNC_REPORT"
+        exit 1
+    fi
+    published=$new
+else
+    published=$candidate
+fi
+{
+    printf '## Published candidate\n\n- Candidate: `%s`\n- First-parent upstream commits merged this run: **%s**\n' "$published" "$applied"
+    if [ -n "$last" ]; then printf -- '- Last upstream commit merged: `%s`\n' "$last"; fi
+    printf '\nThe PR diff is an unvalidated integration candidate; no build or inference tests were run.\n\n'
+} >> "$SYNC_REPORT"
+if [ -n "$blocked" ]; then
+    {
+        printf '## Blocked: conflict at upstream commit `%s`\n\n' "$blocked"
+        printf 'Subject: %s\n\nConflicting paths:\n\n```text\n' "$(git show -s --format=%s "$blocked")"
+        cat "$tmp/conflicts"
+        printf '```\n\nNo later upstream commits were attempted. Resolve semantically and push a reviewed merge; clean hunks need review too.\n'
+    } >> "$SYNC_REPORT"
+    exit 1
+fi
+printf '## Result: mechanically clean, review required\n' >> "$SYNC_REPORT"
