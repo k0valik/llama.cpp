@@ -105,6 +105,8 @@ class SyncTest(unittest.TestCase):
         self.assertEqual(before, self.remote_tip())
         report = (self.root / 'report.md').read_text()
         self.assertIn('Blocked: conflict', report)
+        self.assertIn('Files changed on both sides', report)
+        self.assertIn('change shared', report)
         self.assertIn('shared', report)
 
 

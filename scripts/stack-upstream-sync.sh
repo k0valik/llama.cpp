@@ -23,6 +23,26 @@ upstream=$(git rev-parse refs/remotes/sync-upstream)
 printf '# Rolling upstream synchronization\n\n- Canonical: `%s`\n- Published candidate before run: `%s`\n- Upstream: `%s`\n\n' "$base" "$candidate" "$upstream" > "$SYNC_REPORT"
 printf 'This is an unvalidated integration candidate, not a daily-driver promotion.\n\n' >> "$SYNC_REPORT"
 
+# Show both outstanding upstream work and files changed independently by the fork.
+# Overlap signals review risk, not an actual conflict or a semantic diagnosis.
+ancestor=$(git merge-base "$candidate" "$upstream")
+count=$(git rev-list --count "$ancestor..$upstream")
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
+{ git diff --name-only "$ancestor" "$candidate"; git diff --name-only "$ancestor" "$base"; } | LC_ALL=C sort -u > "$tmp/candidate-paths"
+git diff --name-only "$ancestor" "$upstream" | LC_ALL=C sort > "$tmp/upstream-paths"
+LC_ALL=C comm -12 "$tmp/candidate-paths" "$tmp/upstream-paths" > "$tmp/overlap"
+overlap_count=$(wc -l < "$tmp/overlap")
+{
+    printf '## Upstream work since common ancestor\n\n'
+    printf 'Common ancestor: `%s`. Upstream commits: **%s** (showing at most 60).\n\n```text\n' "$ancestor" "$count"
+    git log --no-merges -60 --format='%h %s' "$ancestor..$upstream"
+    printf '```\n\n## Files changed on both sides\n\n'
+    printf '**%s** overlapping paths (showing at most 80). Even clean merges need semantic review.\n\n```text\n' "$overlap_count"
+    awk 'NR <= 80 { print }' "$tmp/overlap"
+    printf '```\n\n'
+} >> "$SYNC_REPORT"
+
 git switch --detach "$candidate"
 for source in sync-base sync-upstream; do
     if ! git -c core.hooksPath=/dev/null -c rerere.enabled=false merge --no-edit --no-ff "refs/remotes/$source"; then
@@ -43,4 +63,4 @@ if [ "$new" != "$candidate" ]; then
         exit 1
     fi
 fi
-printf '## Result\n\nPublished candidate: `%s`. No build or inference tests were run by this workflow.\n' "$new" >> "$SYNC_REPORT"
+printf '## Result: mechanically clean, review required\n\nPublished candidate: `%s`. No build or inference tests were run by this workflow.\n' "$new" >> "$SYNC_REPORT"

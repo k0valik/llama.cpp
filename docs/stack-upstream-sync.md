@@ -15,8 +15,11 @@ branches. Runs are serialized; simultaneous human pushes are protected by Git's
 non-fast-forward rejection.
 
 The PR body and Actions summary are **generated and replaced** on every run.
-They contain exact input and resulting commit IDs, or conflicting paths if a
-merge fails. The existing remote candidate is not changed by a conflicting run;
+They contain exact input and resulting commit IDs, up to 60 upstream commit
+subjects since the common ancestor, and up to 80 paths modified on both sides.
+The totals make truncation visible. Overlapping paths signal review risk even when
+Git merged them cleanly; they are not a semantic diagnosis. On a conflict the
+report also lists the unmerged paths. The existing remote candidate is not changed by a conflicting run;
 its previous state may be stale. Inspect the workflow log if fetch or another
 error occurs before the report is written. Do not treat an automatic clean merge
 as reviewed, built, or numerically validated. The workflow is not a release or
