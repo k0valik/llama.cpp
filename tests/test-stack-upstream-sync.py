@@ -90,6 +90,48 @@ class SyncTest(unittest.TestCase):
         self.assertEqual(before, self.remote_tip())
         self.assertIn('push rejected', (self.root / 'report.md').read_text())
 
+    def test_clean_prefix_conflict_and_manual_resolution(self):
+        self.commit(self.seed, 'upstream-only', 'clean prefix\n')
+        prefix = self.git(self.seed, 'rev-parse', 'HEAD')
+        self.commit(self.seed, 'shared', 'upstream\n')
+        blocked = self.git(self.seed, 'rev-parse', 'HEAD')
+        self.commit(self.seed, 'later', 'not yet\n')
+        later = self.git(self.seed, 'rev-parse', 'HEAD')
+        self.git(self.seed, 'push', 'upstream', 'master')
+        self.git(self.seed, 'switch', CANDIDATE)
+        self.commit(self.seed, 'shared', 'candidate\n')
+        self.git(self.seed, 'push', 'origin', CANDIDATE)
+        before = self.remote_tip()
+
+        result = self.worker_run()
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        published = self.remote_tip()
+        self.assertNotEqual(before, published)
+        self.git(self.worker, 'merge-base', '--is-ancestor', prefix, published)
+        self.assertNotEqual(run('git', 'merge-base', '--is-ancestor', blocked, published,
+                                cwd=self.worker, check=False).returncode, 0)
+        report = (self.root / 'report.md').read_text()
+        self.assertIn(blocked, report)
+        self.assertIn('First-parent upstream commits merged this run: **1**', report)
+        self.assertIn('shared', report)
+        result = self.worker_run()
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertEqual(published, self.remote_tip())
+
+        # A human resolves exactly the blocked commit, then automation continues.
+        self.git(self.seed, 'fetch', 'origin', CANDIDATE)
+        self.git(self.seed, 'switch', '--detach', 'FETCH_HEAD')
+        result = run('git', 'merge', '--no-edit', '--no-ff', blocked, cwd=self.seed, check=False)
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        (self.seed / 'shared').write_text('resolved\n')
+        self.git(self.seed, 'add', 'shared')
+        self.git(self.seed, 'commit', '--no-edit')
+        self.git(self.seed, 'push', 'origin', 'HEAD:refs/heads/' + CANDIDATE)
+        result = self.worker_run()
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.git(self.worker, 'merge-base', '--is-ancestor', later, 'HEAD')
+        self.assertEqual((self.worker / 'shared').read_text(), 'resolved\n')
+
     def test_conflict_does_not_publish_partial_base_merge(self):
         self.commit(self.seed, 'shared', 'upstream\n')
         self.git(self.seed, 'push', 'upstream', 'master')

@@ -7,9 +7,12 @@ Actions → Stack upstream sync → Run workflow. Schedule times are UTC and Git
 may delay or skip scheduled runs. Actions needs permission to create PRs.
 
 The job fetches the canonical branch, the published candidate, and
-`ggml-org/llama.cpp` master, then merges canonical followed by upstream in a
-fresh checkout. It publishes only if both merges complete and a normal
-(non-force) push succeeds. It does not run builds, tests, or scripts from the
+`ggml-org/llama.cpp` master, then merges canonical followed by upstream commits
+in first-parent order in a fresh checkout. It publishes the clean prefix with a
+normal (non-force) push, stops at the first conflict, and never skips ahead. A
+first-parent upstream merge commit can include its entire side branch. If the
+canonical merge conflicts or the first upstream commit conflicts, it leaves the
+remote candidate unchanged. It does not run builds, tests, or scripts from the
 merged tree. The worker script is copied out of the checkout before switching
 branches. Runs are serialized; simultaneous human pushes are protected by Git's
 non-fast-forward rejection.
@@ -19,8 +22,10 @@ They contain exact input and resulting commit IDs, up to 60 upstream commit
 subjects since the common ancestor, and up to 80 paths modified on both sides.
 The totals make truncation visible. Overlapping paths signal review risk even when
 Git merged them cleanly; they are not a semantic diagnosis. On a conflict the
-report also lists the unmerged paths. The existing remote candidate is not changed by a conflicting run;
-its previous state may be stale. Inspect the workflow log if fetch or another
+report also lists the blocked upstream commit and unmerged paths. A conflicting
+run can publish an earlier clean prefix; the PR's Files changed tab shows that
+prefix, not the blocked commit or later changes. The job is marked failed when
+blocked, even if the report was successfully published. Inspect the workflow log if fetch or another
 error occurs before the report is written. Do not treat an automatic clean merge
 as reviewed, built, or numerically validated. The workflow is not a release or
 promotion mechanism and never pushes canonical.
