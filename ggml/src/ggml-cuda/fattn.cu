@@ -907,6 +907,7 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
 
     bool need_f16_K = false;
     bool need_f16_V = false;
+    bool use_q4i8 = false;
 
     switch (kernel) {
         case BEST_FATTN_KERNEL_TILE:
@@ -914,8 +915,8 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
             need_f16_V = true;
             break;
         case BEST_FATTN_KERNEL_MMA_F16: {
-            const bool use_q4i8 = getenv("GGML_CUDA_FA_NO_Q4I8") == nullptr &&
-                                 ggml_cuda_flash_attn_ext_mma_q4i8_supported(device, dst);
+            use_q4i8 = getenv("GGML_CUDA_FA_NO_Q4I8") == nullptr &&
+                        ggml_cuda_flash_attn_ext_mma_q4i8_supported(device, dst);
             // INT8 dispatch takes precedence over the optional packed prefill path.
             need_f16_K = use_q4i8 ? K->type != GGML_TYPE_Q4_0 :
                          !ggml_cuda_flash_attn_ext_mma_f16_use_q4_0_KV(ggml_cuda_info().devices[device].cc, dst) &&
@@ -934,7 +935,16 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
     const ggml_cuda_flash_attn_ext_f16_extra_data f16_extra =
         ggml_cuda_flash_attn_ext_get_f16_extra_data(dst, need_f16_K, need_f16_V);
 
-    return f16_extra.end - (uintptr_t) dst->data;
+    const size_t alloc_size = f16_extra.end - (uintptr_t) dst->data;
+    if (K->type == GGML_TYPE_Q5_0 && V->type == GGML_TYPE_Q4_1 && getenv("GGML_CUDA_MIXED_TRACE")) {
+        // Reservation intent, separate from MIXED_DISPATCH/MIXED_MMA execution records.
+        fprintf(stderr, "MIXED_ALLOC kernel=%d int8=%d queries=%lld kv=%lld sequences=%lld gqa=%lld "
+            "k_row=%zu v_row=%zu convert_k=%d convert_v=%d out_bytes=%zu extra_bytes=%zu total_bytes=%zu\n",
+            (int) kernel, use_q4i8 ? 1 : 0, (long long) Q->ne[1], (long long) K->ne[1], (long long) Q->ne[3],
+            (long long) (Q->ne[2]/K->ne[2]), K->nb[1], V->nb[1], need_f16_K ? 1 : 0, need_f16_V ? 1 : 0,
+            ggml_nbytes(dst), alloc_size - ggml_nbytes(dst), alloc_size);
+    }
+    return alloc_size;
 }
 
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
