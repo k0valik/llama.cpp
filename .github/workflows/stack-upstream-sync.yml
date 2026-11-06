@@ -18,10 +18,12 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     env:
-      SYNC_REPORT: ${{ runner.temp }}/stack-upstream-sync-report.md
       GH_TOKEN: ${{ github.token }}
       GH_REPO: ${{ github.repository }}
     steps:
+      - name: Set report path
+        run: echo "SYNC_REPORT=$RUNNER_TEMP/stack-upstream-sync-report.md" >> "$GITHUB_ENV"
+
       - name: Check out trusted default branch
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
