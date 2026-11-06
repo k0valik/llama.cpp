@@ -295,6 +295,16 @@ bool llm_graph_input_pos::can_reuse(const llm_graph_params & params) {
     return res;
 }
 
+ggml_tensor * llm_graph_input_mtp_draft::mask_logits(ggml_context * ctx, ggml_tensor * logits) {
+    if (!logit_mask) {
+        logit_mask = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, logits->ne[0]);
+        ggml_set_input(logit_mask);
+        ggml_set_name(logit_mask, "mtp_draft_logit_mask");
+    }
+    GGML_ASSERT(logit_mask->ne[0] == logits->ne[0]);
+    return ggml_add(ctx, logits, logit_mask);
+}
+
 void llm_graph_input_mtp_draft::set_input(const llama_ubatch * ubatch) {
     GGML_ASSERT(ubatch->pos && ubatch->token && ubatch->embd_state);
     GGML_ASSERT((int64_t) ubatch->n_tokens == n_first + n_steps - 1);
@@ -335,6 +345,13 @@ void llm_graph_input_mtp_draft::set_input(const llama_ubatch * ubatch) {
         }
     }
     ggml_backend_tensor_set(pos, data.data(), 0, data.size()*ggml_element_size(pos));
+
+    if (logit_mask) {
+        GGML_ASSERT(dh->n_used > 0 && dh->n_used <= logit_mask->ne[0]);
+        std::vector<float> mask(logit_mask->ne[0], -INFINITY);
+        std::fill_n(mask.begin(), dh->n_used, 0.0f);
+        ggml_backend_tensor_set(logit_mask, mask.data(), 0, mask.size()*sizeof(float));
+    }
 
     if (rng) {
         int32_t v[6] = { (int32_t) dh->noise_seed, (int32_t) dh->noise_k0, 0, dh->n_used, dh->noise_top_k, 0 };
