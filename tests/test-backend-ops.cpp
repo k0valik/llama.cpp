@@ -13775,7 +13775,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 
     // Mixed Q5_0 K / Q4_1 V: speculative verification and prefill shapes.
     for (int kv : { 512, 4096 }) {
-        for (int nb : { 3, 4, 32 }) {
+        for (int nb : { 3, 4, 32, 64, 256 }) {
             for (bool kv_view : { false, true }) {
                 test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, nb, true, false, 0, 0,
                     GGML_PREC_F32, GGML_TYPE_Q5_0, GGML_TYPE_Q4_1, {0, 1, 2, 3}, kv_view));
@@ -13791,8 +13791,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 4096, nb, true, false, 0, 0,
             GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0, {0, 1, 2, 3}, true));
     }
-    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 4096, 256, true, false, 0, 0,
-        GGML_PREC_F32, GGML_TYPE_Q5_0, GGML_TYPE_Q4_1, {0, 1, 2, 3}, true));
+    for (int64_t nr2 : {2, 4, 8}) {
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {nr2, 1}, 512, 64, true, false, 0, 0,
+            GGML_PREC_F32, GGML_TYPE_Q5_0, GGML_TYPE_Q4_1, {0, 2, 1, 3}));
+    }
+    // INT8 prefill boundary, partial query tile, multiple sequences and guarded fallbacks.
+    for (int nb : {63, 77}) {
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 2}, 512, nb, true, false, 0, 0,
+            GGML_PREC_F32, GGML_TYPE_Q5_0, GGML_TYPE_Q4_1, {0, 2, 1, 3}));
+    }
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 512, 64, true, true, 0, 0,
+        GGML_PREC_F32, GGML_TYPE_Q5_0, GGML_TYPE_Q4_1));
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 512, 64, true, false, 8, 0,
+        GGML_PREC_F32, GGML_TYPE_Q5_0, GGML_TYPE_Q4_1));
 
     // prefill-shaped cases with long KV (nb >= 32, kv >= 1024): covers the
     // XMX/GEMM-accelerated SYCL FA path which only activates for these shapes.

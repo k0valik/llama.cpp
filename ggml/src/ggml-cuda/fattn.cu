@@ -909,11 +909,15 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
             need_f16_K = true;
             need_f16_V = true;
             break;
-        case BEST_FATTN_KERNEL_MMA_F16:
-            need_f16_K = !ggml_cuda_flash_attn_ext_mma_f16_use_q4_0_KV(ggml_cuda_info().devices[device].cc, dst) &&
+        case BEST_FATTN_KERNEL_MMA_F16: {
+            const bool use_q4i8 = getenv("GGML_CUDA_FA_NO_Q4I8") == nullptr &&
+                                 ggml_cuda_flash_attn_ext_mma_q4i8_supported(device, dst);
+            // INT8 dispatch takes precedence over the optional packed prefill path.
+            need_f16_K = use_q4i8 ? K->type != GGML_TYPE_Q4_0 :
+                         !ggml_cuda_flash_attn_ext_mma_f16_use_q4_0_KV(ggml_cuda_info().devices[device].cc, dst) &&
                          !ggml_cuda_flash_attn_ext_mma_f16_use_mixed_KV(ggml_cuda_info().devices[device].cc, dst);
             need_f16_V = need_f16_K;
-            break;
+        } break;
         case BEST_FATTN_KERNEL_VEC: {
             const bool f16_fallback = ggml_cuda_get_fattn_vec_case(Q->ne[0], K->type, V->type) == nullptr;
             need_f16_K = K->type == GGML_TYPE_F32 || f16_fallback;

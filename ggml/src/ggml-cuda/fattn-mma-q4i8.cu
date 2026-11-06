@@ -763,8 +763,9 @@ static void q4i8_launch(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
         shared_memory_limit_raised[id] = true;
     }
 
+    // Mixed K/V uses the F16 specialization after conversion into the existing scratch buffers.
     launch_fattn<Q4I8_D, ncols1, ncols2>
-        (ctx, dst, fattn_kernel, Q4I8_NWARPS, nbytes_shared, Q4I8_NBATCH, false, false, true, false, WARP_SIZE);
+        (ctx, dst, fattn_kernel, Q4I8_NWARPS, nbytes_shared, Q4I8_NBATCH, kv_f16, kv_f16, true, false, WARP_SIZE);
 }
 
 } // namespace
@@ -789,12 +790,17 @@ bool ggml_cuda_flash_attn_ext_mma_q4i8_supported(const int device, const ggml_te
         return false;
     }
 
+    // Mixed prefill uses INT8 by default; set GGML_CUDA_MIXED_INT8_PREFILL=0 to opt out.
+    const char * mixed_int8 = getenv("GGML_CUDA_MIXED_INT8_PREFILL");
+    const bool mixed_f16 = K->type == GGML_TYPE_Q5_0 && V->type == GGML_TYPE_Q4_1 &&
+                           (!mixed_int8 || strcmp(mixed_int8, "0") != 0);
+
     if (K->type == GGML_TYPE_Q4_0 && V->type == GGML_TYPE_Q4_0) {
         // head size 256, no ALiBi, no softcap, padded KV, 16 byte alignment of K/V/Q/mask rows:
         if (!ggml_cuda_flash_attn_ext_mma_f16_use_q4_0_KV(cc, dst)) {
             return false;
         }
-    } else if (K->type == GGML_TYPE_F16 && V->type == GGML_TYPE_F16) {
+    } else if ((K->type == GGML_TYPE_F16 && V->type == GGML_TYPE_F16) || mixed_f16) {
         float max_bias      = 0.0f;
         float logit_softcap = 0.0f;
         memcpy(&max_bias,      (const float *) dst->op_params + 1, sizeof(float));
@@ -838,7 +844,11 @@ static void ggml_cuda_flash_attn_ext_mma_q4i8_switch_ncols2(ggml_backend_cuda_co
 }
 
 void ggml_cuda_flash_attn_ext_mma_q4i8(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
-    if (dst->src[1]->type == GGML_TYPE_F16) {
+    if (dst->src[1]->type == GGML_TYPE_Q5_0 && getenv("GGML_CUDA_MIXED_TRACE")) {
+        fprintf(stderr, "MIXED_INT8_PREFILL queries=%lld kv=%lld converted=1\n",
+            (long long) dst->src[0]->ne[1], (long long) dst->src[1]->ne[1]);
+    }
+    if (dst->src[1]->type != GGML_TYPE_Q4_0) {
         ggml_cuda_flash_attn_ext_mma_q4i8_switch_ncols2<true>(ctx, dst);
     } else {
         ggml_cuda_flash_attn_ext_mma_q4i8_switch_ncols2<false>(ctx, dst);
