@@ -13613,8 +13613,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
-    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 32768, 3, true, false, 0, 0,
-        GGML_PREC_F32, GGML_TYPE_Q5_0, GGML_TYPE_Q4_1, {0, 1, 2, 3}, true));
+    for (int kv : {32768, 131072}) {
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, 3, true, false, 0, 0,
+            GGML_PREC_F32, GGML_TYPE_Q5_0, GGML_TYPE_Q4_1, {0, 1, 2, 3}, true));
+    }
     for (int nb : {3, 32}) {
         test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 4096, nb, true, false, 0, 0,
             GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0, {0, 1, 2, 3}, true));

@@ -619,14 +619,16 @@ static bool test(int n_seeds) {
 
 } // namespace spec_sim
 
-static bool test_mtp_padding() {
+static bool test_mtp_padding(bool use_cuda = false) {
 #ifndef GGML_USE_CPU
     printf("MTP padded-head confidence: skipped (CPU backend not linked)\n");
     return true;
 #else
-    ggml_backend_t backend = ggml_backend_cpu_init();
+    ggml_backend_t backend = use_cuda ? ggml_backend_init_by_name("CUDA0", nullptr) : ggml_backend_cpu_init();
     GGML_ASSERT(backend);
-    ggml_backend_cpu_set_n_threads(backend, 1);
+    if (!use_cuda) {
+        ggml_backend_cpu_set_n_threads(backend, 1);
+    }
 
     ggml_init_params params = { 2*1024*1024, nullptr, true };
     ggml_context * ctx = ggml_init(params);
@@ -702,7 +704,7 @@ static bool test_mtp_padding() {
             ok &= std::fabs(sum_p - 1.0) < 1e-6 && std::fabs(sum_c - 1.0) < 1e-6;
         }
     }
-    printf("MTP padded-head confidence and graph reuse: %s\n", ok ? "OK" : "FAILED");
+    printf("MTP padded-head confidence and graph reuse (%s): %s\n", ggml_backend_name(backend), ok ? "OK" : "FAILED");
     ggml_backend_buffer_free(buf);
     ggml_free(ctx);
     ggml_backend_free(backend);
@@ -713,9 +715,10 @@ static bool test_mtp_padding() {
 int main(int argc, char ** argv) {
     const int64_t n_samples = argc > 1 ? atoll(argv[1]) : 200000;
 
-    bool ok = test_mtp_padding();
+    const bool padding_cuda = argc > 1 && std::string(argv[1]) == "--mtp-padding-cuda";
+    bool ok = test_mtp_padding(padding_cuda);
 
-    if (argc > 1 && std::string(argv[1]) == "--mtp-padding-only") {
+    if (padding_cuda || (argc > 1 && std::string(argv[1]) == "--mtp-padding-only")) {
         return ok ? 0 : 1;
     }
 
