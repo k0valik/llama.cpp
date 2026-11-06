@@ -24,6 +24,9 @@
 #include <atomic>
 #include <array>
 #include <cfloat>
+#include <cerrno>
+#include <chrono>
+#include <cmath>
 #include <cinttypes>
 #include <cstdarg>
 #include <cstdint>
@@ -9842,6 +9845,173 @@ struct test_flash_attn_ext : public test_case {
     }
 };
 
+static void mixed_compare_env(const char * key, const char * value) {
+#ifdef _WIN32
+    GGML_ASSERT(_putenv_s(key, value) == 0);
+#else
+    GGML_ASSERT(setenv(key, value, 1) == 0);
+#endif
+}
+
+static int test_mixed_compare(int argc, char ** argv) {
+    if (argc < 5 || argc > 7) {
+        fprintf(stderr, "usage: %s mixed-compare KV QUERIES OUTPUT_PREFIX [Q_SCALE=1] [REPEATS=3]\n", argv[0]);
+        return 1;
+    }
+    auto parse_int = [](const char * text) -> long {
+        char * end;
+        errno = 0;
+        const long value = strtol(text, &end, 10);
+        return errno == 0 && *text && *end == '\0' ? value : -1;
+    };
+    const int64_t kv = parse_int(argv[2]);
+    const int64_t nq = parse_int(argv[3]);
+    char * scale_end = nullptr;
+    const double q_scale = argc >= 6 ? strtod(argv[5], &scale_end) : 1.0;
+    const long repeats = argc >= 7 ? parse_int(argv[6]) : 3;
+    if (kv < 256 || kv > 131072 || kv % 256 || nq < 1 || nq > 256 ||
+            !std::isfinite(q_scale) || q_scale <= 0 || q_scale > 100 ||
+            (scale_end && (scale_end == argv[5] || *scale_end)) || repeats < 1 || repeats > 1000) {
+        fprintf(stderr, "invalid mixed-compare dimensions, scale or repeat count\n");
+        return 1;
+    }
+
+    constexpr int D = 256;
+    constexpr int heads = 4;
+    constexpr int gqa = 6;
+    std::mt19937 rng(1234);
+    auto random_value = [&]() { return float(int32_t(rng() >> 8) - 8388608) / 8388608.0f; };
+    std::vector<uint8_t> k_data(ggml_row_size(GGML_TYPE_Q5_0, D)*kv*heads);
+    std::vector<uint8_t> v_data(ggml_row_size(GGML_TYPE_Q4_1, D)*kv*heads);
+    for (bool is_k : {true, false}) {
+        const ggml_type type = is_k ? GGML_TYPE_Q5_0 : GGML_TYPE_Q4_1;
+        auto & data = is_k ? k_data : v_data;
+        const size_t row_bytes = ggml_row_size(type, D);
+        std::array<float, D> row;
+        for (int64_t i = 0; i < kv*heads; ++i) {
+            for (float & value : row) {
+                value = random_value();
+            }
+            GGML_ASSERT(ggml_quantize_chunk(type, row.data(), data.data() + i*row_bytes, 0, 1, D, nullptr) == row_bytes);
+        }
+    }
+    std::vector<float> q_data(D*nq*heads*gqa);
+    for (float & value : q_data) {
+        value = random_value()*q_scale;
+    }
+    std::vector<ggml_fp16_t> mask(kv*nq);
+    for (int64_t j = 0; j < nq; ++j) {
+        for (int64_t i = 0; i < kv; ++i) {
+            mask[j*kv + i] = ggml_fp32_to_fp16(i <= kv - nq + j ? 0.0f : -INFINITY);
+        }
+    }
+    uint64_t hash = UINT64_C(14695981039346656037);
+    auto hash_bytes = [&](const void * data, size_t size) {
+        const auto * bytes = (const uint8_t *) data;
+        for (size_t i = 0; i < size; ++i) {
+            hash = (hash ^ bytes[i])*UINT64_C(1099511628211);
+        }
+    };
+    hash_bytes(k_data.data(), k_data.size());
+    hash_bytes(v_data.data(), v_data.size());
+    hash_bytes(q_data.data(), q_data.size()*sizeof(float));
+    hash_bytes(mask.data(), mask.size()*sizeof(ggml_fp16_t));
+    printf("MIXED_INPUT kv=%lld queries=%lld q_scale=%.9g hash=%016" PRIx64 "\n",
+        (long long) kv, (long long) nq, q_scale, hash);
+
+    mixed_compare_env("GGML_CUDA_DISABLE_GRAPHS", "1");
+    ggml_backend_load_all();
+    ggml_backend_dev_t dev = ggml_backend_dev_by_name("CUDA0");
+    if (!dev) {
+        fprintf(stderr, "mixed-compare requires CUDA0\n");
+        return 1;
+    }
+    std::vector<std::vector<float>> outputs;
+    for (const char * mode : {"auto", "direct", "matched", "convert"}) {
+        const bool matched = strcmp(mode, "matched") == 0;
+        mixed_compare_env("GGML_CUDA_MIXED_ATTN_MODE", matched ? "direct" : mode);
+        mixed_compare_env("GGML_CUDA_MIXED_MATCH_CONFIG", matched ? "1" : "0");
+        // A fresh backend avoids reusing a CUDA graph captured under another mode.
+        ggml_backend_ptr backend(ggml_backend_dev_init(dev, nullptr));
+        if (!backend) {
+            return 1;
+        }
+        ggml_init_params params = {32*ggml_tensor_overhead() + ggml_graph_overhead(), nullptr, true};
+        ggml_context_ptr ctx(ggml_init(params));
+        if (!ctx) {
+            return 1;
+        }
+        test_flash_attn_ext test(D, D, heads, {gqa, 1}, kv, nq, true, false, 0, 0,
+            GGML_PREC_F32, GGML_TYPE_Q5_0, GGML_TYPE_Q4_1, {0, 1, 2, 3}, false);
+        ggml_tensor * out = test.build_graph(ctx.get());
+        ggml_cgraph * graph = ggml_new_graph(ctx.get());
+        ggml_build_forward_expand(graph, out);
+        if (!ggml_backend_supports_op(backend.get(), out)) {
+            fprintf(stderr, "unsupported mixed-compare mode %s\n", mode);
+            return 1;
+        }
+        ggml_backend_buffer_ptr buffer(ggml_backend_alloc_ctx_tensors(ctx.get(), backend.get()));
+        if (!buffer) {
+            return 1;
+        }
+        auto set_checked = [&](ggml_tensor * t, const void * data, size_t size) {
+            GGML_ASSERT(ggml_nbytes(t) == size);
+            ggml_backend_tensor_set(t, data, 0, size);
+            std::vector<uint8_t> actual(size);
+            ggml_backend_tensor_get(t, actual.data(), 0, size);
+            GGML_ASSERT(memcmp(data, actual.data(), size) == 0);
+        };
+        set_checked(out->src[0], q_data.data(), q_data.size()*sizeof(float));
+        set_checked(out->src[1], k_data.data(), k_data.size());
+        set_checked(out->src[2], v_data.data(), v_data.size());
+        set_checked(out->src[3], mask.data(), mask.size()*sizeof(ggml_fp16_t));
+        std::vector<float> result(ggml_nelements(out)), first;
+        int changed_runs = 0;
+        double total_us = 0;
+        for (long r = 0; r < repeats; ++r) {
+            const auto begin = std::chrono::steady_clock::now();
+            if (ggml_backend_graph_compute(backend.get(), graph) != GGML_STATUS_SUCCESS) {
+                return 1;
+            }
+            ggml_backend_synchronize(backend.get());
+            total_us += std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - begin).count();
+            ggml_backend_tensor_get(out, result.data(), 0, result.size()*sizeof(float));
+            for (float value : result) {
+                if (!std::isfinite(value)) {
+                    fprintf(stderr, "nonfinite result in mode %s\n", mode);
+                    return 1;
+                }
+            }
+            if (r == 0) {
+                first = result;
+            } else if (memcmp(first.data(), result.data(), result.size()*sizeof(float))) {
+                ++changed_runs;
+            }
+        }
+        const std::string filename = std::string(argv[4]) + "-" + mode + ".f32";
+        std::ofstream file(filename, std::ios::binary);
+        file.write((const char *) first.data(), first.size()*sizeof(float));
+        file.close();
+        if (!file) {
+            fprintf(stderr, "cannot save %s\n", filename.c_str());
+            return 1;
+        }
+        printf("MIXED_RESULT mode=%s elements=%zu repeat_changes=%d wall_us=%.3f file=%s\n",
+            mode, first.size(), changed_runs, total_us/repeats, filename.c_str());
+        outputs.push_back(std::move(first));
+    }
+    const char * modes[] = {"auto", "direct", "matched"};
+    for (size_t i = 0; i < 3; ++i) {
+        double max_abs = 0;
+        for (size_t j = 0; j < outputs[i].size(); ++j) {
+            max_abs = std::max(max_abs, double(fabsf(outputs[i][j] - outputs.back()[j])));
+        }
+        printf("MIXED_DIFFERENCE mode=%s reference=convert nmse=%.12g max_abs=%.12g\n",
+            modes[i], nmse(outputs.back().data(), outputs[i].data(), outputs[i].size()), max_abs);
+    }
+    return 0;
+}
+
 // large Q values, so the online softmax has to rescale the partial results
 struct test_flash_attn_ext_large_logits : public test_flash_attn_ext {
     static constexpr int q_range = 20;
@@ -15403,6 +15573,9 @@ static void usage(char ** argv) {
 }
 
 int main(int argc, char ** argv) {
+    if (argc > 1 && strcmp(argv[1], "mixed-compare") == 0) {
+        return test_mixed_compare(argc, argv);
+    }
     test_mode mode = MODE_TEST;
     output_formats output_format = CONSOLE;
     const char * op_names_filter = nullptr;

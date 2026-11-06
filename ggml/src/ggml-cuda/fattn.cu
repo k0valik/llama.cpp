@@ -169,11 +169,33 @@ bool ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(const int cc, const ggml_
 #endif // !defined(GGML_USE_MUSA)
 }
 
+// Diagnostic controls are read per graph; change them only between backend instances.
+static int ggml_cuda_mixed_attn_mode() {
+    const char * value = getenv("GGML_CUDA_MIXED_ATTN_MODE");
+    if (!value || strcmp(value, "auto") == 0) {
+        return 0;
+    }
+    if (strcmp(value, "direct") == 0) {
+        return 1;
+    }
+    if (strcmp(value, "convert") == 0) {
+        return 2;
+    }
+    if (strcmp(value, "convert-auto") == 0) {
+        return 3;
+    }
+    GGML_ABORT("invalid GGML_CUDA_MIXED_ATTN_MODE: %s", value);
+}
+
 static bool ggml_cuda_flash_attn_ext_mma_f16_use_packed_KV(const int cc, const ggml_tensor * dst, const bool mixed) {
     const ggml_tensor * Q    = dst->src[0];
     const ggml_tensor * K    = dst->src[1];
     const ggml_tensor * V    = dst->src[2];
     const ggml_tensor * mask = dst->src[3];
+
+    if (mixed && ggml_cuda_mixed_attn_mode() >= 2) {
+        return false;
+    }
 
     // The direct Q4 loader does not gather the upstream per-query KV row map.
     if (dst->src[5] || K->type != (mixed ? GGML_TYPE_Q5_0 : GGML_TYPE_Q4_0) ||
@@ -230,6 +252,21 @@ bool ggml_cuda_flash_attn_ext_mma_f16_use_mixed_KV(const int cc, const ggml_tens
     return ggml_cuda_flash_attn_ext_mma_f16_use_packed_KV(cc, dst, true);
 }
 
+template <int DKQ, int DV, int ncols1, int ncols2>
+static void ggml_cuda_mixed_attn_mma_case(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    if (getenv("GGML_CUDA_MIXED_TRACE") && dst->src[1]->type == GGML_TYPE_Q5_0 && dst->src[2]->type == GGML_TYPE_Q4_1) {
+        const int cc = ggml_cuda_info().devices[ctx.device].cc;
+        const bool packed = ggml_cuda_flash_attn_ext_mma_f16_use_mixed_KV(cc, dst);
+        const char * match_env = getenv("GGML_CUDA_MIXED_MATCH_CONFIG");
+        const bool matched = match_env && strcmp(match_env, "1") == 0;
+        const auto cfg = ggml_cuda_fattn_mma_config_q4_0(
+            ggml_cuda_fattn_mma_get_config(DKQ, DV, ncols1*ncols2, cc), DKQ, DV, ncols1*ncols2, packed && !matched);
+        fprintf(stderr, "MIXED_MMA packed=%d tile=%dx%d threads=%d kv_step=%d target_occupancy=%d\n",
+            packed ? (matched ? 3 : 2) : 0, ncols1, ncols2, cfg.nthreads, cfg.nbatch_fa, cfg.occupancy);
+    }
+    ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, ncols1, ncols2>(ctx, dst);
+}
+
 template <int DKQ, int DV, int ncols2>
 static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
@@ -240,7 +277,7 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1(ggml_backend_cuda_con
         // a sparse variant at the full tile width gathers the union of its queries once, prefer it for large batches
         constexpr bool has_wide_sparse = ggml_cuda_flash_attn_ext_mma_f16_may_use_sparse(DKQ, DV, 64/ncols2, ncols2);
         if (!(has_wide_sparse && Q->ne[1] > 32/ncols2) && ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(cc, dst, 1, ncols2)) {
-            ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 1, ncols2>(ctx, dst);
+            ggml_cuda_mixed_attn_mma_case<DKQ, DV, 1, ncols2>(ctx, dst);
             return;
         }
     }
@@ -248,25 +285,25 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1(ggml_backend_cuda_con
 
     if constexpr (ncols2 <= 8) {
         if (turing_mma_available(cc) && Q->ne[1] <= 8/ncols2) {
-            ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 8/ncols2, ncols2>(ctx, dst);
+            ggml_cuda_mixed_attn_mma_case<DKQ, DV, 8/ncols2, ncols2>(ctx, dst);
             return;
         }
     }
 
     if constexpr (ncols2 <= 16) {
         if (Q->ne[1] <= 16/ncols2) {
-            ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 16/ncols2, ncols2>(ctx, dst);
+            ggml_cuda_mixed_attn_mma_case<DKQ, DV, 16/ncols2, ncols2>(ctx, dst);
             return;
         }
     }
 
     if (Q->ne[1] <= 32/ncols2 || (GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) == GGML_CUDA_CC_TURING) ||
             (GGML_CUDA_CC_IS_AMD(cc) && DKQ > 256)) {
-        ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 32/ncols2, ncols2>(ctx, dst);
+        ggml_cuda_mixed_attn_mma_case<DKQ, DV, 32/ncols2, ncols2>(ctx, dst);
         return;
     }
 
-    ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 64/ncols2, ncols2>(ctx, dst);
+    ggml_cuda_mixed_attn_mma_case<DKQ, DV, 64/ncols2, ncols2>(ctx, dst);
 }
 
 template <int DKQ, int DV>
@@ -754,6 +791,12 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
 
     // If Turing tensor cores are available, use them:
     if (turing_mma_available(cc) && Q->ne[0] != 40 && Q->ne[0] != 72) {
+        if (GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_BLACKWELL &&
+                Q->ne[0] == 256 && K->type == GGML_TYPE_Q5_0 && V->type == GGML_TYPE_Q4_1 &&
+                (ggml_cuda_mixed_attn_mode() == 2 ||
+                 (ggml_cuda_mixed_attn_mode() == 1 && ggml_cuda_flash_attn_ext_mma_f16_use_mixed_KV(cc, dst)))) {
+            return BEST_FATTN_KERNEL_MMA_F16;
+        }
         if (can_use_vector_kernel) {
             if (!ggml_is_quantized(K->type) && !ggml_is_quantized(V->type)) {
                 // the sparse gather exists only in the MMA kernel: (DKQ, DV, 1, 8) with GQA > 4
@@ -886,9 +929,83 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
     return f16_extra.end - (uintptr_t) dst->data;
 }
 
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+template <bool is_k>
+static __global__ void ggml_cuda_mixed_unpack_check_kernel(const char * src, half2 * dst) {
+    constexpr int row_bytes = ggml_cuda_fattn_mma_packed_row_bytes(256, 2, is_k);
+    __shared__ __align__(16) char raw[32*row_bytes];
+    __shared__ __align__(16) half2 tile[32*128];
+    flash_attn_ext_f16_load_tile_q4_0_raw<256, 4, 32, 2, is_k>(src, raw, row_bytes, blockIdx.x*32);
+    ggml_cuda_fattn_cp_async_commit();
+    ggml_cuda_fattn_cp_async_wait_group<0>();
+    __syncthreads();
+    flash_attn_ext_f16_dequantize_tile_mixed<256, 128, 4, 32, is_k>(raw, tile);
+    __syncthreads();
+    for (int p = threadIdx.y*32 + threadIdx.x; p < 32*128; p += 128) {
+        dst[blockIdx.x*32*128 + p] = *swizzle<128>(tile, p, p/128);
+    }
+}
+
+static __global__ void ggml_cuda_mixed_unpack_compare(
+        const half * ref, const half * actual, const int64_t n, unsigned long long * stats) {
+    const int64_t i = int64_t(blockIdx.x)*blockDim.x + threadIdx.x;
+    if (i < n && __half_as_ushort(ref[i]) != __half_as_ushort(actual[i])) {
+        atomicAdd(stats, 1ULL);
+        atomicMax(stats + 1, (unsigned long long) __float_as_uint(fabsf(__half2float(ref[i]) - __half2float(actual[i]))));
+        atomicMin(stats + 2, (unsigned long long) i);
+    }
+}
+
+static void ggml_cuda_mixed_check_unpack(ggml_backend_cuda_context & ctx, const ggml_tensor * dst) {
+    GGML_ASSERT(getenv("GGML_CUDA_DISABLE_GRAPHS") && "unpack check requires CUDA graphs disabled");
+    for (const ggml_tensor * t : {dst->src[1], dst->src[2]}) {
+        GGML_ASSERT(ggml_is_contiguous(t) && t->ne[0] == 256 && ggml_nrows(t) % 32 == 0);
+        const int64_t n = ggml_nelements(t);
+        const cudaStream_t stream = ctx.stream();
+        ggml_cuda_pool_alloc<half> ref(ctx.pool());
+        ggml_cuda_pool_alloc<half> actual(ctx.pool());
+        ggml_cuda_pool_alloc<unsigned long long> stats(ctx.pool());
+        ref.alloc(n);
+        actual.alloc(n);
+        stats.alloc(3);
+        unsigned long long result[3] = {0, 0, ~0ULL};
+        CUDA_CHECK(cudaMemcpyAsync(stats.ptr, result, sizeof(result), cudaMemcpyHostToDevice, stream));
+        ggml_get_to_fp16_cuda(t->type)(t->data, ref.ptr, n, stream);
+        const dim3 grid(ggml_nrows(t)/32);
+        const dim3 block(32, 4);
+        if (t->type == GGML_TYPE_Q5_0) {
+            ggml_cuda_mixed_unpack_check_kernel<true><<<grid, block, 0, stream>>>((const char *) t->data, (half2 *) actual.ptr);
+        } else {
+            ggml_cuda_mixed_unpack_check_kernel<false><<<grid, block, 0, stream>>>((const char *) t->data, (half2 *) actual.ptr);
+        }
+        ggml_cuda_mixed_unpack_compare<<<(n + 255)/256, 256, 0, stream>>>(ref.ptr, actual.ptr, n, stats.ptr);
+        CUDA_CHECK(cudaGetLastError());
+        CUDA_CHECK(cudaMemcpyAsync(result, stats.ptr, sizeof(result), cudaMemcpyDeviceToHost, stream));
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        const uint32_t max_bits = result[1];
+        float max_abs;
+        memcpy(&max_abs, &max_bits, sizeof(max_abs));
+        fprintf(stderr, "MIXED_UNPACK type=%s values=%lld different=%llu max_abs=%.9g first_index=%llu\n",
+            ggml_type_name(t->type), (long long) n, result[0], max_abs, result[2]);
+    }
+}
+#endif
+
 void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_cuda_set_device(ctx.device);
-    switch (ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst)) {
+    const best_fattn_kernel kernel = ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst);
+    const bool mixed = dst->src[1]->type == GGML_TYPE_Q5_0 && dst->src[2]->type == GGML_TYPE_Q4_1;
+    if (mixed && getenv("GGML_CUDA_MIXED_TRACE")) {
+        fprintf(stderr, "MIXED_DISPATCH mode=%d kernel=%d kv=%lld queries=%lld gqa=%lld\n",
+            ggml_cuda_mixed_attn_mode(), (int) kernel, (long long) dst->src[1]->ne[1],
+            (long long) dst->src[0]->ne[1], (long long) (dst->src[0]->ne[2]/dst->src[1]->ne[2]));
+    }
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    if (mixed && getenv("GGML_CUDA_MIXED_UNPACK_CHECK")) {
+        ggml_cuda_mixed_check_unpack(ctx, dst);
+    }
+#endif
+    switch (kernel) {
         case BEST_FATTN_KERNEL_NONE:
             GGML_ABORT("fatal error");
         case BEST_FATTN_KERNEL_TILE:

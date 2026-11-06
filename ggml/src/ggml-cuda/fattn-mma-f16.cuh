@@ -631,7 +631,7 @@ static __device__ __forceinline__ int ggml_cuda_fattn_mma_q4_0_perm_V(const int 
 }
 
 static constexpr __host__ __device__ int ggml_cuda_fattn_mma_packed_row_bytes(const int D, const int kind, const bool is_k) {
-    return kind == 2 ? D/32 * (is_k ? (int) sizeof(block_q5_0) : (int) sizeof(block_q4_1)) : ggml_cuda_fattn_mma_q4_0_row_bytes(D);
+    return kind >= 2 ? D/32 * (is_k ? (int) sizeof(block_q5_0) : (int) sizeof(block_q4_1)) : ggml_cuda_fattn_mma_q4_0_row_bytes(D);
 }
 
 static constexpr __host__ __device__ int ggml_cuda_fattn_mma_q4_0_stage_bytes(const int DKQ, const int DV, const int ncols1, const int nbatch_fa, const int kind = 1) {
@@ -829,7 +829,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_q4_0_step(
     ggml_cuda_fattn_cp_async_commit();
 
     if constexpr (!direct) {
-        if constexpr (kind == 2) {
+        if constexpr (kind >= 2) {
             flash_attn_ext_f16_dequantize_tile_mixed<DKQ, stride_tile_K, nwarps, nbatch_fa, true>
                 (stages + ((kb0 - kb0_start) % nstages)*stage_bytes + mask_bytes, tile_K);
         } else {
@@ -1039,7 +1039,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
     constexpr int  cols_per_warp   = T_B_KQ::I;
     constexpr int  cols_per_thread = get_cols_per_thread();
     constexpr int  np              = cols_per_warp > ncols ? nwarps : nwarps * cols_per_warp/ncols; // Number of parallel CUDA warps per Q column.
-    constexpr int  nbatch_fa       = ggml_cuda_fattn_mma_get_nbatch_fa(DKQ, DV, ncols, q4_0_KV != 0);
+    constexpr int  nbatch_fa       = ggml_cuda_fattn_mma_get_nbatch_fa(DKQ, DV, ncols, q4_0_KV > 0 && q4_0_KV < 3);
     constexpr int  nbatch_K2       = ggml_cuda_fattn_mma_get_nbatch_K2(DKQ, DV, ncols);
     constexpr int  nbatch_V2       = ggml_cuda_fattn_mma_get_nbatch_V2(DKQ, DV, ncols);
     constexpr bool Q_in_reg        = ggml_cuda_fattn_mma_get_Q_in_reg (DKQ, DV, ncols);
@@ -1477,7 +1477,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
         if constexpr (q4_0_KV && !q4_0_direct) {
             // tile_V == tile_K: wait until all warps are done with K, tile_KV_raw points to the raw K/V of the current stage.
             __syncthreads();
-            if constexpr (q4_0_KV == 2) {
+            if constexpr (q4_0_KV >= 2) {
                 flash_attn_ext_f16_dequantize_tile_mixed<DV, stride_tile_V, nwarps, nbatch_fa, false>
                     (tile_KV_raw + nbatch_fa*ggml_cuda_fattn_mma_packed_row_bytes(DKQ, q4_0_KV, true), tile_V);
             } else {
@@ -1740,7 +1740,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
     constexpr int  cols_per_warp   = T_B_KQ::I;
     constexpr int  cols_per_thread = get_cols_per_thread();
     constexpr int  np              = cols_per_warp > ncols ? nwarps : nwarps * cols_per_warp/ncols; // Number of parallel CUDA warps per Q column.
-    constexpr int  nbatch_fa       = ggml_cuda_fattn_mma_get_nbatch_fa     (DKQ, DV, ncols, q4_0_KV != 0);
+    constexpr int  nbatch_fa       = ggml_cuda_fattn_mma_get_nbatch_fa     (DKQ, DV, ncols, q4_0_KV > 0 && q4_0_KV < 3);
     constexpr int  nbatch_K2       = ggml_cuda_fattn_mma_get_nbatch_K2     (DKQ, DV, ncols);
     constexpr int  nbatch_V2       = ggml_cuda_fattn_mma_get_nbatch_V2     (DKQ, DV, ncols);
     constexpr int  nbatch_combine  = ggml_cuda_fattn_mma_get_nbatch_combine(DKQ, DV, ncols);
@@ -2378,7 +2378,7 @@ static constexpr __host__ __device__ bool ggml_cuda_flash_attn_ext_mma_f16_may_u
 }
 
 template<int DKQ, int DV, int ncols1, int ncols2, bool use_logit_softcap, bool V_is_K_view, bool use_sparse, int q4_0_KV = 0>
-__launch_bounds__(ggml_cuda_fattn_mma_get_nthreads(DKQ, DV, ncols1*ncols2, q4_0_KV != 0), ggml_cuda_fattn_mma_get_occupancy(DKQ, DV, ncols1*ncols2, q4_0_KV != 0))
+__launch_bounds__(ggml_cuda_fattn_mma_get_nthreads(DKQ, DV, ncols1*ncols2, q4_0_KV > 0 && q4_0_KV < 3), ggml_cuda_fattn_mma_get_occupancy(DKQ, DV, ncols1*ncols2, q4_0_KV > 0 && q4_0_KV < 3))
 static __global__ void flash_attn_ext_f16(
         const char * Q_ptr,
         const char * K_ptr,
@@ -2466,8 +2466,8 @@ static __global__ void flash_attn_ext_f16(
 
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
     constexpr int ncols     = ncols1 * ncols2;
-    constexpr int nbatch_fa = ggml_cuda_fattn_mma_get_nbatch_fa(DKQ, DV, ncols, q4_0_KV != 0);
-    constexpr int nthreads  = ggml_cuda_fattn_mma_get_nthreads(DKQ, DV, ncols, q4_0_KV != 0);
+    constexpr int nbatch_fa = ggml_cuda_fattn_mma_get_nbatch_fa(DKQ, DV, ncols, q4_0_KV > 0 && q4_0_KV < 3);
+    constexpr int nthreads  = ggml_cuda_fattn_mma_get_nthreads(DKQ, DV, ncols, q4_0_KV > 0 && q4_0_KV < 3);
     constexpr int nwarps    = nthreads / warp_size;
 
     const int gqa_ratio = ne02 / ne12; // With grouped query attention there are > 1 Q matrices per K, V matrix.
@@ -2610,12 +2610,15 @@ void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml
 
     constexpr int ncols = ncols1 * ncols2;
 
-    // 0: F16 conversion, 1: original Q4_0/Q4_0, 2: experimental Q5_0/Q4_1 tiled loader.
+    // 0: conversion, 1: Q4_0/Q4_0, 2: mixed, 3: mixed with the conversion-path configuration.
+    const char * match_env = getenv("GGML_CUDA_MIXED_MATCH_CONFIG");
+    const bool match_config = match_env && strcmp(match_env, "1") == 0;
     const int q4_0_KV = ggml_cuda_flash_attn_ext_mma_f16_use_q4_0_KV(cc, dst) ? 1 :
-                        ggml_cuda_flash_attn_ext_mma_f16_use_mixed_KV(cc, dst) ? 2 : 0;
+                        ggml_cuda_flash_attn_ext_mma_f16_use_mixed_KV(cc, dst) ? (match_config ? 3 : 2) : 0;
+    const bool q4_config = q4_0_KV > 0 && q4_0_KV < 3;
 
-    const int  nthreads       = ggml_cuda_fattn_mma_get_nthreads      (DKQ, DV, ncols, cc, q4_0_KV);
-    const int  nbatch_fa      = ggml_cuda_fattn_mma_get_nbatch_fa     (DKQ, DV, ncols, cc, q4_0_KV);
+    const int  nthreads       = ggml_cuda_fattn_mma_get_nthreads      (DKQ, DV, ncols, cc, q4_config);
+    const int  nbatch_fa      = ggml_cuda_fattn_mma_get_nbatch_fa     (DKQ, DV, ncols, cc, q4_config);
     const int  nbatch_K2      = ggml_cuda_fattn_mma_get_nbatch_K2     (DKQ, DV, ncols, cc);
     const int  nbatch_V2      = ggml_cuda_fattn_mma_get_nbatch_V2     (DKQ, DV, ncols, cc);
     const int  nbatch_combine = ggml_cuda_fattn_mma_get_nbatch_combine(DKQ, DV, ncols, cc);
@@ -2664,11 +2667,13 @@ void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml
             GGML_ASSERT(nstages > 1 && logit_softcap == 0.0f);
             if (q4_0_KV == 2) {
                 fattn_kernel = flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, false, V_is_K_view, false, 2>;
+            } else if (q4_0_KV == 3) {
+                fattn_kernel = flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, false, V_is_K_view, false, 3>;
             } else {
                 fattn_kernel = flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, false, V_is_K_view, false, 1>;
             }
 
-            static bool shared_memory_limit_raised[GGML_CUDA_MAX_DEVICES][3] = {};
+            static bool shared_memory_limit_raised[GGML_CUDA_MAX_DEVICES][4] = {};
             if (!shared_memory_limit_raised[id][q4_0_KV]) {
                 CUDA_CHECK(cudaFuncSetAttribute(reinterpret_cast<fattn_kernel_ptr_t>(fattn_kernel), cudaFuncAttributeMaxDynamicSharedMemorySize, nbytes_shared_total));
                 shared_memory_limit_raised[id][q4_0_KV] = true;
