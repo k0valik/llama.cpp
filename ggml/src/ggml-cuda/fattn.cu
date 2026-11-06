@@ -382,14 +382,18 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2(ggml_backend_cuda_con
         }
     }
 
-    // Large batches with F16 or directly read q4_0 K/V are compute bound: use the largest ncols2 that divides the GQA ratio
-    //     so that no tensor core work is spent on padding heads (e.g. GQA 6 would waste 1/4 of it with ncols2 == 8).
-    //     Only tested on consumer Blackwell, where this is the fallback of the INT8 kernel in fattn-mma-q4i8.cu.
+    // Avoid padding GQA heads for large F16/packed batches and intermediate packed mixed batches
+    //     (e.g. GQA 6 would waste 1/4 of the tensor core work with ncols2 == 8).
+    //     Keep short-query behavior and the matched-config conversion reference unchanged.
     if constexpr (DKQ == 256 && DV == 256) {
         const bool KV_f16 = K->type == GGML_TYPE_F16 && V->type == GGML_TYPE_F16;
-        if (use_gqa_opt && Q->ne[1] >= 64 && gqa_ratio % 8 != 0 && gqa_ratio % 2 == 0 &&
+        const bool mixed = K->type == GGML_TYPE_Q5_0 && V->type == GGML_TYPE_Q4_1;
+        const char * match_env = mixed ? getenv("GGML_CUDA_MIXED_MATCH_CONFIG") : nullptr;
+        const bool KV_mixed = mixed && !(match_env && strcmp(match_env, "1") == 0) &&
+                              ggml_cuda_flash_attn_ext_mma_f16_use_mixed_KV(cc, dst);
+        if (use_gqa_opt && (Q->ne[1] >= 64 || (KV_mixed && Q->ne[1] > 4)) && gqa_ratio % 8 != 0 && gqa_ratio % 2 == 0 &&
                 GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_BLACKWELL && cc < GGML_CUDA_CC_RUBIN &&
-                (KV_f16 || ggml_cuda_flash_attn_ext_mma_f16_use_q4_0_KV(cc, dst))) {
+                (KV_f16 || KV_mixed || ggml_cuda_flash_attn_ext_mma_f16_use_q4_0_KV(cc, dst))) {
             if (gqa_ratio % 4 == 0) {
                 ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<DKQ, DV, 4>(ctx, dst);
             } else {

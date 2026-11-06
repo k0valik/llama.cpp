@@ -13806,6 +13806,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {nr2, 2}, 512, 33, true, false, 0, 0,
             GGML_PREC_F32, GGML_TYPE_Q5_0, GGML_TYPE_Q4_1, {0, 2, 1, 3}));
     }
+    // Odd ratios retain generic grouping; non-power-of-two even ratios avoid padding heads.
+    for (int64_t nr2 : {3, 10, 12}) {
+        for (int nb : {5, 33}) {
+            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {nr2, 2}, 512, nb, true, false, 0, 0,
+                GGML_PREC_F32, GGML_TYPE_Q5_0, GGML_TYPE_Q4_1, {0, 2, 1, 3}));
+        }
+    }
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 512, 5, false, false, 0, 0,
         GGML_PREC_F32, GGML_TYPE_Q5_0, GGML_TYPE_Q4_1));
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 512, 33, true, false, 8, 0,
