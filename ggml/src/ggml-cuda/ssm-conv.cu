@@ -90,7 +90,7 @@ static __global__ void ssm_conv_long_token_f32(const float * __restrict__ src0, 
 #pragma unroll
     for (int idx = 0; idx < total_elems; idx += split_d_inner) {
         if (row < (int)split_d_inner) {
-            smem[row * n_cols + col] = x_block[row * stride_x + col];
+            smem[row * n_cols + col] = col < d_conv - 1 + local_n_t ? x_block[row * stride_x + col] : 0.0f;
         }
 
         col += split_d_inner;
@@ -206,7 +206,20 @@ void ggml_cuda_op_ssm_conv(ggml_backend_cuda_context & ctx, ggml_tensor * dst, g
     }
 }
 
-// Fused short-sequence conv-state path (see ggml_cuda_try_fuse_conv_state in ggml-cuda.cu):
+template <int n_state>
+static __device__ __forceinline__ float * conv_state_snapshot_dst(const ggml_cuda_conv_state_snapshots & snaps, const int s, const int c) {
+    int64_t row_offset = 0;
+    if (snaps.rows) {
+        const int32_t row = snaps.rows[s];
+        if (row < 0 || row >= snaps.n_rows) {
+            return nullptr;
+        }
+        row_offset = (int64_t) row * snaps.row_stride;
+    }
+    return snaps.dst[s] + row_offset + (int64_t) c * n_state;
+}
+
+// Fused short-sequence conv-state path (see ggml_cuda_conv_state_fused in ggml-cuda.cu):
 //   [get_rows(conv states)] -> concat(state, x^T) -> K x cpy(snapshot window -> cache) -> ssm_conv -> silu
 // One thread per channel builds the (d_conv - 1 + n_t) window in shared memory, writes the snapshots and the
 // silu'd conv outputs. Every thread only touches its own channel in every buffer, so reading the state row
@@ -262,10 +275,12 @@ static __global__ void ssm_conv_state_fused_f32(
     }
     for (int s = 0; s < snaps.n; ++s) {
         const int off = snaps.off[s];
-        float * dst = snaps.dst[s] + (int64_t) c * n_state;
+        float * dst = conv_state_snapshot_dst<n_state>(snaps, s, c);
+        if (dst) {
 #pragma unroll
-        for (int j = 0; j < n_state; ++j) {
-            dst[j] = win_smem[(off + j) * blockDim.x + tid];
+            for (int j = 0; j < n_state; ++j) {
+                dst[j] = win_smem[(off + j) * blockDim.x + tid];
+            }
         }
     }
 
@@ -334,10 +349,12 @@ static __global__ void ssm_conv_state_fused_long_f32(
             }
         }
         for (int s = 0; s < snaps.n; ++s) {
-            float * dst = snaps.dst[s] + (int64_t) c * n_state;
+            float * dst = conv_state_snapshot_dst<n_state>(snaps, s, c);
+            if (dst) {
 #pragma unroll
-            for (int j = 0; j < n_state; ++j) {
-                dst[j] = v[s][j];
+                for (int j = 0; j < n_state; ++j) {
+                    dst[j] = v[s][j];
+                }
             }
         }
     }

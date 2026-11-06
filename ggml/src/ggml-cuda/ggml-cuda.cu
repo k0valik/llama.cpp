@@ -4262,6 +4262,7 @@ struct ggml_cuda_conv_state_match {
     ggml_tensor * concat   = nullptr;
     ggml_tensor * cpy[GGML_CUDA_CONV_STATE_MAX_SNAPSHOTS] = {};
     int           n_cpy    = 0;
+    ggml_tensor * set_rows = nullptr; // optional overlapping snapshot windows with device slot indices
     ggml_tensor * ssm_conv = nullptr;
     ggml_tensor * silu     = nullptr;
     int           last     = -1;      // index of the silu node
@@ -4279,7 +4280,7 @@ static bool ggml_cuda_conv_state_check(const ggml_cgraph * cgraph, ggml_cuda_con
     const int64_t n_state = d_conv - 1;
     const int64_t nr      = c->ne[1];
     const int64_t n_t     = c->ne[0] - n_state;
-    if ((d_conv != 3 && d_conv != 4) || n_t < 1 || n_t > 65535 * 32 || w->type != GGML_TYPE_F32 ||
+    if ((d_conv != 3 && d_conv != 4) || nr < 1 || nr > INT32_MAX || n_t < 1 || n_t > 65535 * 32 || w->type != GGML_TYPE_F32 ||
         w->nb[0] != sizeof(float) || w->ne[1] != nr || !ggml_cuda_fusion_is_leaf(w)) {
         return false;
     }
@@ -4294,7 +4295,7 @@ static bool ggml_cuda_conv_state_check(const ggml_cgraph * cgraph, ggml_cuda_con
         !ggml_are_same_shape(conv, m.silu)) {
         return false;
     }
-    if (ggml_cuda_fusion_use_count(cgraph, c) != 1 + m.n_cpy || ggml_cuda_fusion_use_count(cgraph, conv) != 1) {
+    if (ggml_cuda_fusion_use_count(cgraph, c) != 1 + m.n_cpy + (m.set_rows ? 1 : 0) || ggml_cuda_fusion_use_count(cgraph, conv) != 1) {
         return false;
     }
     for (int s = 0; s < m.n_cpy; ++s) {
@@ -4309,6 +4310,27 @@ static bool ggml_cuda_conv_state_check(const ggml_cgraph * cgraph, ggml_cuda_con
         }
         if (cpy->type != GGML_TYPE_F32 || d->type != GGML_TYPE_F32 || !ggml_is_contiguous(d) ||
             ggml_nelements(d) != n_state * nr || (cpy->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+            return false;
+        }
+    }
+    if (m.set_rows) {
+        const char * enabled = getenv("GGML_CUDA_FUSE_CONV_SNAPSHOT_ROWS");
+        const ggml_tensor * v    = m.set_rows->src[0];
+        const ggml_tensor * rows = m.set_rows->src[1];
+        const ggml_tensor * d    = m.set_rows->src[2];
+        if (!enabled || strcmp(enabled, "1") != 0 || m.n_cpy != 0 ||
+            m.set_rows->type != GGML_TYPE_F32 || d->type != GGML_TYPE_F32 || !ggml_cuda_fusion_is_leaf(d) ||
+            d->ne[0] != n_state || d->ne[1] < 1 || d->ne[1] > GGML_CUDA_CONV_STATE_MAX_SNAPSHOTS || d->ne[2] != nr || d->ne[3] != 1 ||
+            d->nb[0] != sizeof(float) || d->nb[2] != n_state*sizeof(float) || d->nb[1] < n_state*nr*sizeof(float) ||
+            d->nb[1] % sizeof(float) != 0 || d->nb[1] > INT64_MAX/GGML_CUDA_CONV_STATE_MAX_SNAPSHOTS ||
+            (m.set_rows->flags & GGML_TENSOR_FLAG_OUTPUT) ||
+            v->op != GGML_OP_VIEW || v->view_src != c || v->src[0] != c || v->type != GGML_TYPE_F32 ||
+            v->ne[0] != n_state || v->ne[1] < 1 || v->ne[1] > d->ne[1] || v->ne[1] > n_t + 1 || v->ne[2] != nr || v->ne[3] != 1 ||
+            v->nb[0] != sizeof(float) || v->nb[1] != sizeof(float) || v->nb[2] != c->nb[1] ||
+            v->view_offs % sizeof(float) != 0 || v->view_offs/sizeof(float) > (size_t) (n_t + 1 - v->ne[1]) ||
+            ggml_cuda_fusion_use_count(cgraph, v) != 1 || (v->flags & GGML_TENSOR_FLAG_OUTPUT) ||
+            rows->type != GGML_TYPE_I32 || !ggml_is_contiguous(rows) || !ggml_cuda_fusion_is_leaf(rows) ||
+            rows->ne[0] != v->ne[1] || rows->ne[1] != 1 || rows->ne[2] != 1 || rows->ne[3] != 1) {
             return false;
         }
     }
@@ -4345,7 +4367,11 @@ static void ggml_cuda_conv_state_reorder(ggml_cgraph * cgraph, ggml_backend_grap
             if (n->op == GGML_OP_VIEW) {
                 continue;
             }
-            if (n->op == GGML_OP_CPY && n->src[0]->view_src == c) {
+            if (n->op == GGML_OP_SET_ROWS && n->src[0]->view_src == c && !m.set_rows && m.n_cpy == 0) {
+                m.set_rows = n;
+                continue;
+            }
+            if (n->op == GGML_OP_CPY && n->src[0]->view_src == c && !m.set_rows) {
                 if (m.n_cpy == GGML_CUDA_CONV_STATE_MAX_SNAPSHOTS) {
                     ok = false;
                     break;
@@ -4355,7 +4381,7 @@ static void ggml_cuda_conv_state_reorder(ggml_cgraph * cgraph, ggml_backend_grap
             }
             break;
         }
-        if (!ok || m.n_cpy == 0) {
+        if (!ok || (m.n_cpy == 0 && !m.set_rows)) {
             continue;
         }
         const int last_cpy = k - 1;
@@ -4409,6 +4435,10 @@ static void ggml_cuda_conv_state_reorder(ggml_cgraph * cgraph, ggml_backend_grap
             params->add_alloc_dep(params->user_data, m.state, m.silu);
         }
         params->add_alloc_dep(params->user_data, m.xt, m.silu);
+        if (m.set_rows) {
+            params->add_alloc_dep(params->user_data, m.set_rows->src[1], m.silu);
+            params->add_alloc_dep(params->user_data, m.set_rows, m.silu);
+        }
         i = last_cpy + 2;
     }
 }
@@ -4440,7 +4470,11 @@ static int ggml_cuda_conv_state_match_at(const ggml_cgraph * cgraph, int i, ggml
         if (t->op == GGML_OP_VIEW) {
             continue;
         }
-        if (t->op == GGML_OP_CPY && t->src[0]->view_src == m.concat) {
+        if (t->op == GGML_OP_SET_ROWS && t->src[0]->view_src == m.concat && !m.set_rows && m.n_cpy == 0) {
+            m.set_rows = t;
+            continue;
+        }
+        if (t->op == GGML_OP_CPY && t->src[0]->view_src == m.concat && !m.set_rows) {
             if (m.n_cpy == GGML_CUDA_CONV_STATE_MAX_SNAPSHOTS) {
                 return -1;
             }
@@ -4449,7 +4483,7 @@ static int ggml_cuda_conv_state_match_at(const ggml_cgraph * cgraph, int i, ggml
         }
         break;
     }
-    if (m.n_cpy == 0 || k + 1 >= cgraph->n_nodes) {
+    if ((m.n_cpy == 0 && !m.set_rows) || k + 1 >= cgraph->n_nodes) {
         return -1;
     }
     m.ssm_conv = cgraph->nodes[k];
@@ -4464,7 +4498,8 @@ static int ggml_cuda_conv_state_match_at(const ggml_cgraph * cgraph, int i, ggml
     // the kernel reads the inputs while writing silu + snapshots: no aliasing allowed
     const ggml_tensor * rd_state = m.get_rows ? m.get_rows->src[0] : m.state;
     const ggml_tensor * rd_rows  = m.get_rows ? m.get_rows->src[1] : nullptr;
-    const ggml_tensor * reads[4] = { rd_state, rd_rows, m.xt, m.ssm_conv->src[1] };
+    const ggml_tensor * slot_rows = m.set_rows ? m.set_rows->src[1] : nullptr;
+    const ggml_tensor * reads[5] = { rd_state, rd_rows, m.xt, m.ssm_conv->src[1], slot_rows };
     for (const ggml_tensor * r : reads) {
         if (ggml_cuda_fusion_ranges_overlap(m.silu, r)) {
             return -1;
@@ -4476,6 +4511,24 @@ static int ggml_cuda_conv_state_match_at(const ggml_cgraph * cgraph, int i, ggml
             ggml_cuda_fusion_ranges_overlap(d, rd_rows) || ggml_cuda_fusion_ranges_overlap(d, m.ssm_conv->src[1]) ||
             (!m.get_rows && ggml_cuda_fusion_ranges_overlap(d, m.state))) {
             return -1;
+        }
+    }
+    if (m.set_rows) {
+        const ggml_tensor * d = m.set_rows->src[2];
+        if (ggml_cuda_fusion_ranges_overlap(d, m.silu) || ggml_cuda_fusion_ranges_overlap(d, m.xt) ||
+            ggml_cuda_fusion_ranges_overlap(d, rd_rows) || ggml_cuda_fusion_ranges_overlap(d, slot_rows) ||
+            ggml_cuda_fusion_ranges_overlap(d, m.ssm_conv->src[1])) {
+            return -1;
+        }
+        if (ggml_cuda_fusion_ranges_overlap(d, rd_state)) {
+            // In-place writes must keep each channel in the same thread as its state read.
+            const uintptr_t d_addr = (uintptr_t) d->data;
+            const uintptr_t s_addr = (uintptr_t) rd_state->data;
+            const uintptr_t delta = d_addr >= s_addr ? d_addr - s_addr : s_addr - d_addr;
+            if (!m.get_rows || rd_state->nb[1] < (size_t) (m.state->ne[0]*m.state->ne[1])*sizeof(float) || d->nb[1] % rd_state->nb[1] != 0 ||
+                delta % rd_state->nb[1] != 0) {
+                return -1;
+            }
         }
     }
     m.last = k + 1;
@@ -4510,6 +4563,18 @@ static bool ggml_cuda_conv_state_fused(ggml_backend_cuda_context & ctx, const gg
     for (int s = 0; s < m.n_cpy; ++s) {
         a.snaps.dst[s] = (float *) m.cpy[s]->src[1]->data;
         a.snaps.off[s] = (int) (m.cpy[s]->src[0]->view_offs / sizeof(float));
+    }
+    if (m.set_rows) {
+        const ggml_tensor * v = m.set_rows->src[0];
+        const ggml_tensor * d = m.set_rows->src[2];
+        a.snaps.n = (int) v->ne[1];
+        a.snaps.rows = (const int32_t *) m.set_rows->src[1]->data;
+        a.snaps.row_stride = d->nb[1] / sizeof(float);
+        a.snaps.n_rows = (int) d->ne[1];
+        for (int s = 0; s < a.snaps.n; ++s) {
+            a.snaps.dst[s] = (float *) d->data;
+            a.snaps.off[s] = (int) (v->view_offs / sizeof(float)) + s;
+        }
     }
     return ggml_cuda_op_ssm_conv_state_fused(ctx, a);
 }

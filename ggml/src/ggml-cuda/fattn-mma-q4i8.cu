@@ -30,6 +30,8 @@ namespace {
 constexpr int   Q4I8_D         = 256;                              // head size of K, Q and V
 constexpr int   Q4I8_NBLK      = Q4I8_D/QK4_0;                     // q4_0 blocks per K/V row
 constexpr int   Q4I8_ROW_RAW   = Q4I8_NBLK*sizeof(block_q4_0);     // bytes per K/V row
+constexpr int   Q4I8_ROW_K_MIXED = Q4I8_NBLK*sizeof(block_q5_0);
+constexpr int   Q4I8_ROW_V_MIXED = Q4I8_NBLK*sizeof(block_q4_1);
 constexpr int   Q4I8_NBATCH    = 32;                               // K/V rows per iteration
 constexpr int   Q4I8_NWARPS    = 8;
 constexpr int   Q4I8_NTHREADS  = Q4I8_NWARPS*WARP_SIZE;
@@ -60,16 +62,17 @@ constexpr __host__ __device__ int q4i8_mask_bytes(const int ncols1) {
 }
 
 // Bytes per stage of raw data: K + V for q4_0, only K for F16 (V is copied directly to the FP16 V tile).
-constexpr __host__ __device__ int q4i8_raw_bytes(const bool kv_f16) {
-    return kv_f16 ? Q4I8_NBATCH*Q4I8_D*(int) sizeof(half) : 2*Q4I8_RAW_BYTES;
+constexpr __host__ __device__ int q4i8_raw_bytes(const bool kv_f16, const bool kv_mixed) {
+    return kv_mixed ? Q4I8_NBATCH*(Q4I8_ROW_K_MIXED + Q4I8_ROW_V_MIXED) :
+           kv_f16 ? Q4I8_NBATCH*Q4I8_D*(int) sizeof(half) : 2*Q4I8_RAW_BYTES;
 }
 
-constexpr __host__ __device__ int q4i8_off_mask(const bool kv_f16) {
-    return Q4I8_OFF_RAW + 2*q4i8_raw_bytes(kv_f16); // 2 stages of mask tiles
+constexpr __host__ __device__ int q4i8_off_mask(const bool kv_f16, const bool kv_mixed) {
+    return Q4I8_OFF_RAW + 2*q4i8_raw_bytes(kv_f16, kv_mixed); // 2 stages of mask tiles
 }
 
-constexpr __host__ __device__ int q4i8_smem_bytes(const int ncols1, const bool kv_f16) {
-    return q4i8_off_mask(kv_f16) + 2*q4i8_mask_bytes(ncols1);
+constexpr __host__ __device__ int q4i8_smem_bytes(const int ncols1, const bool kv_f16, const bool kv_mixed) {
+    return q4i8_off_mask(kv_f16, kv_mixed) + 2*q4i8_mask_bytes(ncols1);
 }
 
 // Physical 16 byte chunk of the logical chunk c (8 halves) in a row of the dequantized V tile.
@@ -126,9 +129,31 @@ static __device__ __forceinline__ void q4i8_load_V_f16(const char * GGML_CUDA_RE
     }
 }
 
-template <bool kv_f16>
+template <bool kv_f16, bool kv_mixed>
 static __device__ __forceinline__ void q4i8_load_KV(
         const char * GGML_CUDA_RESTRICT K, const char * GGML_CUDA_RESTRICT V, char * GGML_CUDA_RESTRICT stage, const int nb11, const int nb21, const int k_VKQ_0) {
+    if constexpr (kv_mixed) {
+        const unsigned int stage_32 = ggml_cuda_cvta_generic_to_shared(stage);
+        const int tid = threadIdx.y*WARP_SIZE + threadIdx.x;
+        auto load = [&](auto is_k) {
+            constexpr int row_bytes = decltype(is_k)::value ? Q4I8_ROW_K_MIXED : Q4I8_ROW_V_MIXED;
+            constexpr int offset = decltype(is_k)::value ? 0 : Q4I8_NBATCH*Q4I8_ROW_K_MIXED;
+            constexpr int chunks = Q4I8_NBATCH*row_bytes/16;
+            const char * src = decltype(is_k)::value ? K : V;
+            const int stride = decltype(is_k)::value ? nb11 : nb21;
+#pragma unroll
+            for (int c0 = 0; c0 < chunks; c0 += Q4I8_NTHREADS) {
+                const int c = c0 + tid;
+                if (c < chunks) {
+                    cp_async_cg_16<64>(stage_32 + offset + 16*c,
+                        src + int64_t(k_VKQ_0 + c/(row_bytes/16))*stride + 16*(c % (row_bytes/16)));
+                }
+            }
+        };
+        load(std::true_type{});
+        load(std::false_type{});
+        return;
+    }
     if constexpr (kv_f16) {
         constexpr int chunks_per_row = Q4I8_D*sizeof(half)/16;
         constexpr int chunks         = Q4I8_NBATCH*chunks_per_row;
@@ -240,10 +265,78 @@ static __device__ __forceinline__ void q4i8_convert_K_f16(const char * GGML_CUDA
     *(int4 *) (dst_row + 16*((2*seg + 1) ^ (r % 8))) = make_int4(out[4], out[5], out[6], out[7]);
 }
 
+// Match the converted-F16 path's half rounding and row scale without materializing the cache in global memory.
+static __device__ __forceinline__ void q4i8_convert_mixed(const char * GGML_CUDA_RESTRICT stage, char * GGML_CUDA_RESTRICT conv) {
+    const int tid = threadIdx.y*WARP_SIZE + threadIdx.x;
+    const int row = tid / Q4I8_NBLK;
+    const int blk = tid % Q4I8_NBLK;
+    const block_q5_0 * k = (const block_q5_0 *) (stage + row*Q4I8_ROW_K_MIXED) + blk;
+    uint32_t qh;
+    memcpy(&qh, k->qh, sizeof(qh));
+    const float d = __half2float(k->d);
+    __align__(16) half2 values[QK5_0/2];
+#pragma unroll
+    for (int j = 0; j < QK5_0/2; ++j) {
+        const int i = 2*j;
+        const int shift = i >= 16 ? 4 : 0;
+        const int q0 = ((k->qs[i % 16] >> shift) & 15) | (((qh >> i) & 1) << 4);
+        const int q1 = ((k->qs[i % 16 + 1] >> shift) & 15) | (((qh >> (i + 1)) & 1) << 4);
+        values[j] = make_half2((q0 - 16)*d, (q1 - 16)*d);
+    }
+    half2 amax2 = __habs2(values[0]);
+#pragma unroll
+    for (int j = 1; j < QK5_0/2; ++j) {
+        amax2 = __hmax2(amax2, __habs2(values[j]));
+    }
+    float amax = fmaxf(__low2float(amax2), __high2float(amax2));
+#pragma unroll
+    for (int offset = 1; offset < Q4I8_NBLK; offset <<= 1) {
+        amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFF, amax, offset, WARP_SIZE));
+    }
+    const float inv = amax > 0.0f ? 127.0f/amax : 0.0f;
+    if (blk == 0) {
+        ((float *) (conv + Q4I8_OFF_SK))[row] = amax/127.0f;
+    }
+    uint32_t out[8];
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+        const float2 f0 = __half22float2(values[2*j]);
+        const float2 f1 = __half22float2(values[2*j + 1]);
+        const uint32_t i0 = __float_as_uint(fmaf(f0.x, inv, Q4I8_MAGIC_F));
+        const uint32_t i1 = __float_as_uint(fmaf(f0.y, inv, Q4I8_MAGIC_F));
+        const uint32_t i2 = __float_as_uint(fmaf(f1.x, inv, Q4I8_MAGIC_F));
+        const uint32_t i3 = __float_as_uint(fmaf(f1.y, inv, Q4I8_MAGIC_F));
+        out[j] = __byte_perm(__byte_perm(i0, i1, 0x0040), __byte_perm(i2, i3, 0x0040), 0x5410);
+    }
+    char * dst_row = conv + Q4I8_OFF_KQ + row*Q4I8_D;
+    *(int4 *) (dst_row + 16*((2*blk + 0) ^ (row % 8))) = make_int4(out[0], out[1], out[2], out[3]);
+    *(int4 *) (dst_row + 16*((2*blk + 1) ^ (row % 8))) = make_int4(out[4], out[5], out[6], out[7]);
+
+    const block_q4_1 * v = (const block_q4_1 *) (stage + Q4I8_NBATCH*Q4I8_ROW_K_MIXED + row*Q4I8_ROW_V_MIXED) + blk;
+    const float2 dm = __half22float2(v->dm);
+#pragma unroll
+    for (int j = 0; j < QK4_1/2; ++j) {
+        const int i = 2*j;
+        const int shift = i >= 16 ? 4 : 0;
+        const int q0 = (v->qs[i % 16] >> shift) & 15;
+        const int q1 = (v->qs[i % 16 + 1] >> shift) & 15;
+        values[j] = make_half2(q0*dm.x + dm.y, q1*dm.x + dm.y);
+    }
+    half * vh = (half *) (conv + Q4I8_OFF_VH) + row*Q4I8_VH_STRIDE;
+#pragma unroll
+    for (int j = 0; j < QK4_1/8; ++j) {
+        *(int4 *) (vh + 8*q4i8_vh_chunk(blk*(QK4_1/8) + j)) = *(const int4 *) (values + 4*j);
+    }
+}
+
 // Requantize the raw K tile to int8 with one scale per row, dequantize the raw V tile to FP16 (only for q4_0).
 // For q4_0 each thread handles 2 consecutive q4_0 blocks of one K row and/or of one V row.
-template <bool kv_f16>
+template <bool kv_f16, bool kv_mixed>
 static __device__ __forceinline__ void q4i8_convert_stage(const char * GGML_CUDA_RESTRICT stage, char * GGML_CUDA_RESTRICT conv) {
+    if constexpr (kv_mixed) {
+        q4i8_convert_mixed(stage, conv);
+        return;
+    }
     if constexpr (kv_f16) {
         q4i8_convert_K_f16(stage, conv);
         return;
@@ -355,7 +448,7 @@ static __device__ __forceinline__ void q4i8_convert_stage(const char * GGML_CUDA
     }
 }
 
-template <int ncols1, int ncols2, bool kv_f16, bool needs_fixup, bool is_fixup>
+template <int ncols1, int ncols2, bool kv_f16, bool kv_mixed, bool needs_fixup, bool is_fixup>
 static __device__ __forceinline__ void q4i8_process_tile(
         const float2 * const GGML_CUDA_RESTRICT Q_f2,
         const char   * const GGML_CUDA_RESTRICT K,
@@ -376,9 +469,9 @@ static __device__ __forceinline__ void q4i8_process_tile(
         const int kb0_stop) {
     constexpr int ncols = ncols1*ncols2;
     static_assert(ncols == Q4I8_NCOLS, "bad ncols");
-    static_assert(Q4I8_OFF_DQ + Q4I8_NCOLS*4 <= q4i8_smem_bytes(ncols1, kv_f16), "Q staging does not fit");
-    constexpr int raw_bytes = q4i8_raw_bytes(kv_f16);
-    constexpr int off_mask  = q4i8_off_mask(kv_f16);
+    static_assert(Q4I8_OFF_DQ + Q4I8_NCOLS*4 <= q4i8_smem_bytes(ncols1, kv_f16, kv_mixed), "Q staging does not fit");
+    constexpr int raw_bytes = q4i8_raw_bytes(kv_f16, kv_mixed);
+    constexpr int off_mask  = q4i8_off_mask(kv_f16, kv_mixed);
 
     extern __shared__ __align__(16) char smem[];
 
@@ -464,17 +557,17 @@ static __device__ __forceinline__ void q4i8_process_tile(
     __syncthreads(); // Q staging is overwritten by the K/V tiles.
 
     // Pipeline: iteration i uses the converted tile i, converts the raw tile i + 1, and loads the raw tile i + 2 + mask i + 1.
-    q4i8_load_KV<kv_f16>(K, V, smem + Q4I8_OFF_RAW, nb11, nb21, kb0_start*Q4I8_NBATCH);
+    q4i8_load_KV<kv_f16, kv_mixed>(K, V, smem + Q4I8_OFF_RAW, nb11, nb21, kb0_start*Q4I8_NBATCH);
     if constexpr (kv_f16) {
         q4i8_load_V_f16(V, smem, nb21, kb0_start*Q4I8_NBATCH);
     }
     q4i8_load_mask<ncols1>(mask_h, smem + off_mask, stride_mask, kb0_start*Q4I8_NBATCH, jt, ne01);
     if (kb0_start + 1 < kb0_stop_eff) {
-        q4i8_load_KV<kv_f16>(K, V, smem + Q4I8_OFF_RAW + raw_bytes, nb11, nb21, (kb0_start + 1)*Q4I8_NBATCH);
+        q4i8_load_KV<kv_f16, kv_mixed>(K, V, smem + Q4I8_OFF_RAW + raw_bytes, nb11, nb21, (kb0_start + 1)*Q4I8_NBATCH);
     }
     cp_async_wait_all();
     __syncthreads();
-    q4i8_convert_stage<kv_f16>(smem + Q4I8_OFF_RAW, smem);
+    q4i8_convert_stage<kv_f16, kv_mixed>(smem + Q4I8_OFF_RAW, smem);
 
     const uint32_t smem_32 = ggml_cuda_cvta_generic_to_shared(smem);
     const bool convert_first = threadIdx.y >= Q4I8_NWARPS/2;
@@ -488,7 +581,7 @@ static __device__ __forceinline__ void q4i8_process_tile(
         cp_async_wait_all();
         __syncthreads();
         if (kb0 + 2 < kb0_stop_eff) {
-            q4i8_load_KV<kv_f16>(K, V, smem + Q4I8_OFF_RAW + (it % 2)*raw_bytes, nb11, nb21, (kb0 + 2)*Q4I8_NBATCH);
+            q4i8_load_KV<kv_f16, kv_mixed>(K, V, smem + Q4I8_OFF_RAW + (it % 2)*raw_bytes, nb11, nb21, (kb0 + 2)*Q4I8_NBATCH);
         }
         if (kb0 + 1 < kb0_stop_eff) {
             q4i8_load_mask<ncols1>(mask_h, smem + off_mask + ((it + 1) % 2)*q4i8_mask_bytes(ncols1), stride_mask,
@@ -498,7 +591,7 @@ static __device__ __forceinline__ void q4i8_process_tile(
             }
         }
         if (convert_first && kb0 + 1 < kb0_stop_eff) {
-            q4i8_convert_stage<kv_f16>(smem + Q4I8_OFF_RAW + ((it + 1) % 2)*raw_bytes, smem + ((it + 1) % 2)*Q4I8_CONV_SIZE);
+            q4i8_convert_stage<kv_f16, kv_mixed>(smem + Q4I8_OFF_RAW + ((it + 1) % 2)*raw_bytes, smem + ((it + 1) % 2)*Q4I8_CONV_SIZE);
         }
 
         // KQ = K*Q^T, 4 tiles of 8 K rows x 16 columns, all 256 values accumulated in int32:
@@ -599,7 +692,7 @@ static __device__ __forceinline__ void q4i8_process_tile(
         // Warps 0..NWARPS/2-1 convert K after their tensor core work, the other warps convert V before it.
         //     The two groups are thereby out of phase and the ALU work of one group overlaps with the MMAs of the other.
         if (!convert_first && kb0 + 1 < kb0_stop_eff) {
-            q4i8_convert_stage<kv_f16>(smem + Q4I8_OFF_RAW + ((it + 1) % 2)*raw_bytes, smem + ((it + 1) % 2)*Q4I8_CONV_SIZE);
+            q4i8_convert_stage<kv_f16, kv_mixed>(smem + Q4I8_OFF_RAW + ((it + 1) % 2)*raw_bytes, smem + ((it + 1) % 2)*Q4I8_CONV_SIZE);
         }
     }
 
@@ -640,7 +733,7 @@ static __device__ __forceinline__ void q4i8_process_tile(
     }
 }
 
-template <int ncols1, int ncols2, bool kv_f16>
+template <int ncols1, int ncols2, bool kv_f16, bool kv_mixed>
 __launch_bounds__(Q4I8_NTHREADS, 1)
 static __global__ void flash_attn_ext_q4i8(
         const char * Q,
@@ -709,7 +802,7 @@ static __global__ void flash_attn_ext_q4i8(
             kb0_stop_tile = min(kb0_stop_tile, KV_max[sequence*iter_j + jt] / nbatch_fa);
         }
 
-        q4i8_process_tile<ncols1, ncols2, kv_f16, needs_fixup, is_fixup>
+        q4i8_process_tile<ncols1, ncols2, kv_f16, kv_mixed, needs_fixup, is_fixup>
             (Q_f2, K_z, V_z, mask_h, dstk, dst_meta, scale, ne01, ne02, stride_Q1, stride_Q2, nb11, nb21, stride_mask,
              jt, kb0_start, kb0_stop_tile);
     };
@@ -749,12 +842,12 @@ static __global__ void flash_attn_ext_q4i8(
 #endif // defined(FLASH_ATTN_AVAILABLE) && defined(BLACKWELL_MMA_AVAILABLE)
 }
 
-template <int ncols2, bool kv_f16>
+template <int ncols2, bool kv_f16, bool kv_mixed>
 static void q4i8_launch(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     constexpr int ncols1 = Q4I8_NCOLS/ncols2;
-    constexpr int nbytes_shared = q4i8_smem_bytes(ncols1, kv_f16);
+    constexpr int nbytes_shared = q4i8_smem_bytes(ncols1, kv_f16, kv_mixed);
 
-    const fattn_kernel_t fattn_kernel = flash_attn_ext_q4i8<ncols1, ncols2, kv_f16>;
+    const fattn_kernel_t fattn_kernel = flash_attn_ext_q4i8<ncols1, ncols2, kv_f16, kv_mixed>;
 
     static bool shared_memory_limit_raised[GGML_CUDA_MAX_DEVICES] = {false};
     const int id = ggml_cuda_get_device();
@@ -763,12 +856,18 @@ static void q4i8_launch(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
         shared_memory_limit_raised[id] = true;
     }
 
-    // Mixed K/V uses the F16 specialization after conversion into the existing scratch buffers.
+    // Only the converted fallback needs global F16 scratch; packed K/V stays tile-local.
     launch_fattn<Q4I8_D, ncols1, ncols2>
         (ctx, dst, fattn_kernel, Q4I8_NWARPS, nbytes_shared, Q4I8_NBATCH, kv_f16, kv_f16, true, false, WARP_SIZE);
 }
 
 } // namespace
+
+bool ggml_cuda_flash_attn_ext_mma_q4i8_use_mixed_KV(const ggml_tensor * dst) {
+    const char * direct = getenv("GGML_CUDA_MIXED_INT8_DIRECT");
+    return dst->src[1]->type == GGML_TYPE_Q5_0 && dst->src[2]->type == GGML_TYPE_Q4_1 &&
+           (!direct || strcmp(direct, "0") != 0);
+}
 
 bool ggml_cuda_flash_attn_ext_mma_q4i8_supported(const int device, const ggml_tensor * dst) {
     const int cc = ggml_cuda_info().devices[device].cc;
@@ -827,30 +926,33 @@ bool ggml_cuda_flash_attn_ext_mma_q4i8_supported(const int device, const ggml_te
     return gqa_ratio % 2 == 0;
 }
 
-template <bool kv_f16>
+template <bool kv_f16, bool kv_mixed>
 static void ggml_cuda_flash_attn_ext_mma_q4i8_switch_ncols2(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * Q = dst->src[0];
     const ggml_tensor * K = dst->src[1];
 
     const int64_t gqa_ratio = Q->ne[2] / K->ne[2];
     if (gqa_ratio % 8 == 0) {
-        q4i8_launch<8, kv_f16>(ctx, dst);
+        q4i8_launch<8, kv_f16, kv_mixed>(ctx, dst);
     } else if (gqa_ratio % 4 == 0) {
-        q4i8_launch<4, kv_f16>(ctx, dst);
+        q4i8_launch<4, kv_f16, kv_mixed>(ctx, dst);
     } else {
         GGML_ASSERT(gqa_ratio % 2 == 0);
-        q4i8_launch<2, kv_f16>(ctx, dst);
+        q4i8_launch<2, kv_f16, kv_mixed>(ctx, dst);
     }
 }
 
 void ggml_cuda_flash_attn_ext_mma_q4i8(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     if (dst->src[1]->type == GGML_TYPE_Q5_0 && getenv("GGML_CUDA_MIXED_TRACE")) {
-        fprintf(stderr, "MIXED_INT8_PREFILL queries=%lld kv=%lld converted=1\n",
-            (long long) dst->src[0]->ne[1], (long long) dst->src[1]->ne[1]);
+        fprintf(stderr, "MIXED_INT8_PREFILL queries=%lld kv=%lld converted=%d\n",
+            (long long) dst->src[0]->ne[1], (long long) dst->src[1]->ne[1],
+            !ggml_cuda_flash_attn_ext_mma_q4i8_use_mixed_KV(dst));
     }
-    if (dst->src[1]->type != GGML_TYPE_Q4_0) {
-        ggml_cuda_flash_attn_ext_mma_q4i8_switch_ncols2<true>(ctx, dst);
+    if (ggml_cuda_flash_attn_ext_mma_q4i8_use_mixed_KV(dst)) {
+        ggml_cuda_flash_attn_ext_mma_q4i8_switch_ncols2<false, true>(ctx, dst);
+    } else if (dst->src[1]->type != GGML_TYPE_Q4_0) {
+        ggml_cuda_flash_attn_ext_mma_q4i8_switch_ncols2<true, false>(ctx, dst);
     } else {
-        ggml_cuda_flash_attn_ext_mma_q4i8_switch_ncols2<false>(ctx, dst);
+        ggml_cuda_flash_attn_ext_mma_q4i8_switch_ncols2<false, false>(ctx, dst);
     }
 }

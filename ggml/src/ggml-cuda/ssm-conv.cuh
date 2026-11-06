@@ -9,6 +9,9 @@ struct ggml_cuda_conv_state_snapshots {
     float * dst[GGML_CUDA_CONV_STATE_MAX_SNAPSHOTS]; // contiguous [n_state, nr] destination (one sequence)
     int     off[GGML_CUDA_CONV_STATE_MAX_SNAPSHOTS]; // window start of the snapshot
     int     n;
+    const int32_t * rows;     // optional device row indices for SET_ROWS snapshots
+    int64_t row_stride;       // destination slot stride (floats)
+    int     n_rows;
 };
 
 struct ggml_cuda_conv_state_fused_args {

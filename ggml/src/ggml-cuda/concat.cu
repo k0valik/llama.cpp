@@ -2,6 +2,49 @@
 
 #include <stdint.h>
 
+// Append a transposed projection to a short state prefix with coalesced reads and writes.
+template <typename T>
+static __global__ void concat_transpose_state(
+        const T * x, const T * y, T * dst, const int64_t n_state, const int64_t n_t, const int64_t n_rows,
+        const int64_t n2, const int64_t sx1, const int64_t sx2, const int64_t sx3,
+        const int64_t sy0, const int64_t sy2, const int64_t sy3) {
+    __shared__ T tile[32][33];
+    const int64_t i2 = blockIdx.z % n2;
+    const int64_t i3 = blockIdx.z / n2;
+    x += i2*sx2 + i3*sx3;
+    y += i2*sy2 + i3*sy3;
+    dst += int64_t(blockIdx.z)*(n_state + n_t)*n_rows;
+
+    ggml_cuda_pdl_sync();
+#pragma unroll
+    for (int j = 0; j < 32; j += 8) {
+        const int64_t c = int64_t(blockIdx.x)*32 + threadIdx.x;
+        const int64_t t = int64_t(blockIdx.y)*32 + threadIdx.y + j;
+        if (c < n_rows && t < n_t) {
+            tile[threadIdx.y + j][threadIdx.x] = y[t*sy0 + c];
+        }
+    }
+    __syncthreads();
+#pragma unroll
+    for (int j = 0; j < 32; j += 8) {
+        const int64_t c = int64_t(blockIdx.x)*32 + threadIdx.y + j;
+        const int64_t t = int64_t(blockIdx.y)*32 + threadIdx.x;
+        if (c < n_rows && t < n_t) {
+            dst[c*(n_state + n_t) + n_state + t] = tile[threadIdx.x][threadIdx.y + j];
+        }
+    }
+    if (blockIdx.y == 0) {
+        for (int i = threadIdx.y*32 + threadIdx.x; i < 32*n_state; i += 256) {
+            const int64_t c = int64_t(blockIdx.x)*32 + i/n_state;
+            const int s = i % n_state;
+            if (c < n_rows) {
+                dst[c*(n_state + n_t) + s] = x[c*sx1 + s];
+            }
+        }
+    }
+    ggml_cuda_pdl_lc();
+}
+
 // contiguous kernels
 template <typename T, int dim>
 static __global__ void __launch_bounds__(CUDA_CONCAT_BLOCK_SIZE) concat_cont(const T * x,
@@ -141,7 +184,18 @@ static __global__ void __launch_bounds__(CUDA_CONCAT_BLOCK_SIZE)
 
 template <typename T>
 static void concat_cuda(const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, int dim, cudaStream_t stream) {
-    if (dim != 3 && ggml_is_contiguous_to_3(src0) && ggml_is_contiguous_to_3(src1)) {
+    if (dim == 0 && !ggml_is_quantized(src0->type) && ggml_is_contiguous(dst) &&
+            src0->nb[0] == sizeof(T) && src0->ne[0] <= 32 && src1->ne[0] >= 32 &&
+            src1->nb[1] == sizeof(T) && src1->nb[0] >= src1->ne[1]*sizeof(T) &&
+            (src1->ne[0] + 31)/32 <= 65535 && dst->ne[2]*dst->ne[3] <= 65535) {
+        const dim3 grid((dst->ne[1] + 31)/32, (src1->ne[0] + 31)/32, dst->ne[2]*dst->ne[3]);
+        const ggml_cuda_kernel_launch_params lp(grid, dim3(32, 8), 0, stream);
+        ggml_cuda_kernel_launch(concat_transpose_state<T>, lp,
+            (const T *) src0->data, (const T *) src1->data, (T *) dst->data,
+            src0->ne[0], src1->ne[0], dst->ne[1], dst->ne[2],
+            src0->nb[1]/sizeof(T), src0->nb[2]/sizeof(T), src0->nb[3]/sizeof(T),
+            src1->nb[0]/sizeof(T), src1->nb[2]/sizeof(T), src1->nb[3]/sizeof(T));
+    } else if (dim != 3 && ggml_is_contiguous_to_3(src0) && ggml_is_contiguous_to_3(src1)) {
         const T * src0_d = (const T *) src0->data;
         const T * src1_d = (const T *) src1->data;
         T *       dst_d  = (T *) dst->data;

@@ -4931,6 +4931,83 @@ struct test_ssm_conv_bias_silu : public test_case {
     }
 };
 
+// Conv-state snapshots use the same overlapping SET_ROWS windows as build_conv_state.
+struct test_ssm_conv_snapshot_rows : public test_case {
+    const int64_t n_t, K, n_seqs, d_conv;
+    const bool gather, inplace, idx64, rotate;
+    std::vector<ggml_tensor *> checks;
+    static constexpr int64_t nr = 128, mem = 3, cell = 1;
+
+    test_ssm_conv_snapshot_rows(int64_t n_t, int64_t K = 4, int64_t n_seqs = 1, int64_t d_conv = 4,
+            bool gather = true, bool inplace = true, bool idx64 = false, bool rotate = false)
+        : n_t(n_t), K(K), n_seqs(n_seqs), d_conv(d_conv), gather(gather), inplace(inplace), idx64(idx64), rotate(rotate) {}
+
+    std::string vars() override { return VARS_TO_STR8(n_t, K, n_seqs, d_conv, gather, inplace, idx64, rotate); }
+    std::string op_desc(ggml_tensor * t) override { GGML_UNUSED(t); return "SSM_CONV_SNAPSHOT_ROWS"; }
+    bool run_whole_graph() override { return true; }
+    std::vector<ggml_tensor *> fusion_test_nodes() override { return checks; }
+    double max_nmse_err() override { return 1e-6; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        checks.clear();
+        const int64_t ns = d_conv - 1;
+        const int64_t Kw = std::min(n_t + 1, K);
+        const size_t row = ns*nr*sizeof(float);
+        ggml_tensor * cache = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, ns*nr, mem*K);
+        ggml_tensor * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, nr, n_t, n_seqs);
+        ggml_tensor * w = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, d_conv, nr);
+        ggml_set_name(cache, "conv_cache");
+        ggml_tensor * state;
+        if (gather) {
+            ggml_tensor * src_ids = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_seqs);
+            ggml_set_name(src_ids, "conv_src_ids");
+            state = ggml_reshape_3d(ctx, ggml_get_rows(ctx, cache, src_ids), ns, nr, n_seqs);
+        } else {
+            state = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, ns, nr, n_seqs);
+        }
+        ggml_tensor * c = ggml_concat(ctx, state, ggml_transpose(ctx, x), 0);
+        ggml_tensor * windows = ggml_view_4d(ctx, c, ns, Kw, nr, n_seqs,
+                sizeof(float), c->nb[1], c->nb[2], (n_t - (Kw - 1))*sizeof(float));
+        ggml_tensor * slots = ggml_view_4d(ctx, cache, ns, K, nr, n_seqs,
+                mem*row, ns*sizeof(float), row, cell*row);
+        ggml_tensor * ids = ggml_new_tensor_1d(ctx, idx64 ? GGML_TYPE_I64 : GGML_TYPE_I32, Kw);
+        ggml_set_name(ids, "conv_slot_ids");
+        ggml_tensor * update = ggml_set_rows(ctx, slots, windows, ids);
+        ggml_build_forward_expand(gf, update);
+        ggml_tensor * out = ggml_silu(ctx, ggml_ssm_conv(ctx, c, w));
+        ggml_build_forward_expand(gf, out);
+        // Observe all cells, including slots not written by a short ubatch.
+        ggml_tensor * saved = ggml_scale(ctx, cache, 1.0f);
+        ggml_build_forward_expand(gf, saved);
+        checks.push_back(out);
+        checks.push_back(saved);
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->op != GGML_OP_NONE) { continue; }
+            if (strcmp(t->name, "conv_src_ids") == 0) {
+                std::vector<int32_t> ids(n_seqs);
+                for (int64_t s = 0; s < n_seqs; ++s) { ids[s] = (inplace ? cell : 0) + s; }
+                ggml_backend_tensor_set(t, ids.data(), 0, ggml_nbytes(t));
+            } else if (strcmp(t->name, "conv_slot_ids") == 0) {
+                const int64_t Kw = std::min(n_t + 1, K);
+                std::vector<int64_t> ids(Kw);
+                for (int64_t s = 0; s < Kw; ++s) { ids[s] = rotate ? (s + 1) % Kw : Kw - 1 - s; }
+                if (idx64) {
+                    ggml_backend_tensor_set(t, ids.data(), 0, ggml_nbytes(t));
+                } else {
+                    std::vector<int32_t> ids32(ids.begin(), ids.end());
+                    ggml_backend_tensor_set(t, ids32.data(), 0, ggml_nbytes(t));
+                }
+            } else {
+                init_tensor_uniform(t, -0.3f, 0.3f);
+            }
+        }
+    }
+};
+
 // GGML_OP_SSM_SCAN
 struct test_ssm_scan : public test_case {
     const ggml_type type;
@@ -12521,9 +12598,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_ssm_conv(GGML_TYPE_F32, {d_conv, d_inner, 1, 1}, {d_conv, d_inner, 1, 1}));
             test_cases.emplace_back(new test_ssm_conv(GGML_TYPE_F32, {2 * d_conv, d_inner, 1, 1}, {d_conv, d_inner, 1, 1}));
             test_cases.emplace_back(new test_ssm_conv(GGML_TYPE_F32, {d_conv, d_inner, 4, 1}, {d_conv, d_inner, 1, 1}));
-            // long token (n_t > 32, exercises the long_token kernel path)
-            test_cases.emplace_back(new test_ssm_conv(GGML_TYPE_F32, {d_conv - 1 + 64, d_inner, 1, 1}, {d_conv, d_inner, 1, 1}));
-            test_cases.emplace_back(new test_ssm_conv(GGML_TYPE_F32, {d_conv - 1 + 64, d_inner, 4, 1}, {d_conv, d_inner, 1, 1}));
+            // Full and partial token chunks in the long_token kernel path.
+            for (int64_t nt : {33, 64, 65}) {
+                test_cases.emplace_back(new test_ssm_conv(GGML_TYPE_F32, {d_conv - 1 + nt, d_inner, 1, 1}, {d_conv, d_inner, 1, 1}));
+                test_cases.emplace_back(new test_ssm_conv(GGML_TYPE_F32, {d_conv - 1 + nt, d_inner, 4, 1}, {d_conv, d_inner, 1, 1}));
+            }
         }
     }
 
@@ -12547,6 +12626,20 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             }
         }
     }
+
+    for (int64_t dc : {3, 4}) {
+        for (int64_t nt : {1, 3, 4, 16, 17, 31, 32, 33, 65, 256}) {
+            test_cases.emplace_back(new test_ssm_conv_snapshot_rows(nt, 4, 1, dc));
+        }
+    }
+    for (int64_t nt : {3, 33}) {
+        test_cases.emplace_back(new test_ssm_conv_snapshot_rows(nt, 4, 1, 4, false)); // no state gather
+        test_cases.emplace_back(new test_ssm_conv_snapshot_rows(nt, 4, 1, 4, true, false)); // distinct source cell
+        test_cases.emplace_back(new test_ssm_conv_snapshot_rows(nt, 4, 1, 4, true, true, false, true)); // runtime slot order
+        test_cases.emplace_back(new test_ssm_conv_snapshot_rows(nt, 4, 2)); // multi-sequence fallback
+    }
+    test_cases.emplace_back(new test_ssm_conv_snapshot_rows(4, 4, 1, 4, true, true, true)); // I64 index fallback
+    test_cases.emplace_back(new test_ssm_conv_snapshot_rows(33, 9)); // snapshot-capacity fallback
 
     test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, 16, 1, 1024, 1, 32, 4)); // Mamba-1
     test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, 96, 64, 128, 8, 1, 1)); // Nemotron-3-Puzzle decode (scan path, unused warp in last block)
@@ -13517,6 +13610,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // Short convolution state plus transposed projection: partial tiles, batches and padded state rows.
+    for (ggml_type type : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16, GGML_TYPE_I8, GGML_TYPE_I16, GGML_TYPE_I32, GGML_TYPE_I64}) {
+        for (int v : {16, 17}) {
+            test_cases.emplace_back(new test_concat(type, {3, 65, 2, 3}, 33, 0, v));
+        }
+    }
+    for (int nt : {31, 32, 33, 255, 256}) {
+        test_cases.emplace_back(new test_concat(GGML_TYPE_F32, {3, 129, 1, 1}, nt, 0, 16));
+    }
+    test_cases.emplace_back(new test_concat(GGML_TYPE_F32, {32, 33, 1, 1}, 77, 0, 16));
+
     // few long rows, which backends may split across workgroups
     for (int dim : { 0, 1 }) {
         test_cases.emplace_back(new test_concat(GGML_TYPE_F32, {98304, 8, 1, 1}, dim == 0 ? 288 : 2, dim, 0));
@@ -13794,6 +13898,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (int64_t nr2 : {2, 4, 8}) {
         test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {nr2, 1}, 512, 64, true, false, 0, 0,
             GGML_PREC_F32, GGML_TYPE_Q5_0, GGML_TYPE_Q4_1, {0, 2, 1, 3}));
+    }
+    for (int64_t nr2 : {2, 8}) {
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {nr2, 2}, 1024, 77, true, false, 0, 0,
+            GGML_PREC_F32, GGML_TYPE_Q5_0, GGML_TYPE_Q4_1, {0, 1, 2, 3}, true));
     }
     // INT8 prefill boundary, partial query tile, multiple sequences and guarded fallbacks.
     for (int nb : {63, 77}) {
