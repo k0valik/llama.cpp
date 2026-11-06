@@ -46,7 +46,7 @@ jobs:
           cat "$SYNC_REPORT" >> "$GITHUB_STEP_SUMMARY"
           number=$(gh pr list --state open --base port/qwen3.8-27b-cuda-v0.9.0 --head sync/upstream-v090 --json number --jq '.[0].number // empty')
           if [ -n "$number" ]; then
-            gh pr edit "$number" --body-file "$SYNC_REPORT"
+            gh api --method PATCH "repos/$GH_REPO/pulls/$number" -F "body=@$SYNC_REPORT" >/dev/null
           else
             gh pr create --draft --base port/qwen3.8-27b-cuda-v0.9.0 --head sync/upstream-v090 --title 'Rolling upstream integration (review required)' --body-file "$SYNC_REPORT"
           fi
