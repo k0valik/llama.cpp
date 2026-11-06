@@ -786,6 +786,7 @@ void llama_model_qwen35::graph_mtp::build_draft(const llama_model & model, int *
     ggml_tensor * inp_h      = inp->h;
     ggml_tensor * inp_pos    = inp->pos;
     ggml_tensor * inp_rng    = inp->rng;
+    auto * inp_draft = inp.get();
 
     res->add_input(std::move(inp));
 
@@ -927,6 +928,7 @@ void llama_model_qwen35::graph_mtp::build_draft(const llama_model & model, int *
         ggml_tensor * hn = block(e_cur, h_cur, pos, row0, nr);
 
         ggml_tensor * logits = ggml_mul_mat(ctx0, head, hn);
+        logits = inp_draft->mask_logits(ctx0, logits);
         cb(logits, "mtp_draft_logits", il);
 
         // coupled sampling: the same Gumbel noise as the target's draw for this position

@@ -4,6 +4,9 @@
 // spec_sim: speculative decoding with drafters that use the same noise must emit the same, exactly distributed tokens.
 
 #include "ggml.h"
+#include "ggml-cpu.h"
+#include "ggml-alloc.h"
+#include "../src/llama-graph.h"
 #include "llama.h"
 #include "sampling.h"
 #include "speculative.h"
@@ -16,6 +19,7 @@
 #include <functional>
 #include <map>
 #include <random>
+#include <string>
 #include <vector>
 
 struct stats {
@@ -615,10 +619,105 @@ static bool test(int n_seeds) {
 
 } // namespace spec_sim
 
+static bool test_mtp_padding() {
+#ifndef GGML_USE_CPU
+    printf("MTP padded-head confidence: skipped (CPU backend not linked)\n");
+    return true;
+#else
+    ggml_backend_t backend = ggml_backend_cpu_init();
+    GGML_ASSERT(backend);
+    ggml_backend_cpu_set_n_threads(backend, 1);
+
+    ggml_init_params params = { 2*1024*1024, nullptr, true };
+    ggml_context * ctx = ggml_init(params);
+    GGML_ASSERT(ctx);
+
+    llama_mtp_draft_head dh;
+    llm_graph_input_mtp_draft inp(1, 1, 1, &dh);
+    inp.tokens = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1);
+    inp.h = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1, 1);
+    inp.pos = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1);
+    inp.rng = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 6);
+
+    constexpr int n_rows = 1024;
+    ggml_tensor * raw = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_rows, 1);
+    ggml_tensor * ids = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_rows);
+    ggml_tensor * logits = inp.mask_logits(ctx, raw);
+    ggml_tensor * prob = ggml_soft_max(ctx, logits);
+    ggml_tensor * pick = ggml_argmax(ctx, logits);
+    ggml_tensor * noisy = ggml_add_gumbel(ctx, logits, ids, inp.rng, 0);
+    ggml_tensor * confidence = ggml_soft_max(ctx, noisy);
+
+    ggml_cgraph * gf = ggml_new_graph(ctx);
+    for (ggml_tensor * output : {prob, pick, confidence}) {
+        ggml_build_forward_expand(gf, output);
+    }
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, backend);
+    GGML_ASSERT(buf);
+
+    std::vector<float> values(n_rows, 0.0f);
+    values[1] = 1.0f;
+    std::vector<float> token_ids(n_rows, 0.0f);
+    token_ids[1] = 1.0f;
+    ggml_backend_tensor_set(raw, values.data(), 0, values.size()*sizeof(float));
+    ggml_backend_tensor_set(ids, token_ids.data(), 0, token_ids.size()*sizeof(float));
+
+    llama_token token = 0;
+    llama_pos pos = 0;
+    float state = 0.0f;
+    llama_ubatch ubatch = {};
+    ubatch.n_tokens = 1;
+    ubatch.token = &token;
+    ubatch.pos = &pos;
+    ubatch.embd_state = &state;
+
+    bool ok = true;
+    // Update valid rows without rebuilding the graph, including shrink after reset.
+    for (int n_used : {2, 3, 2, n_rows}) {
+        dh.n_used = n_used;
+        for (float temp : {0.0f, 0.7f}) {
+            dh.noise_temp = temp;
+            inp.set_input(&ubatch);
+            GGML_ASSERT(ggml_backend_graph_compute(backend, gf) == GGML_STATUS_SUCCESS);
+            std::vector<float> p(n_rows), c(n_rows);
+            int32_t selected = -1;
+            ggml_backend_tensor_get(prob, p.data(), 0, p.size()*sizeof(float));
+            ggml_backend_tensor_get(confidence, c.data(), 0, c.size()*sizeof(float));
+            ggml_backend_tensor_get(pick, &selected, 0, sizeof(selected));
+            const double expected = std::exp(1.0)/(std::exp(1.0) + n_used - 1);
+            printf("  valid=%d temp=%.1f p[1]=%.9f expected=%.9f\n", n_used, temp, p[1], expected);
+            ok &= selected == 1 && std::fabs(p[1] - expected) < 1e-6;
+            double sum_p = 0.0, sum_c = 0.0;
+            for (int i = 0; i < n_rows; ++i) {
+                ok &= std::isfinite(p[i]) && std::isfinite(c[i]);
+                if (i >= n_used) {
+                    ok &= p[i] == 0.0f && c[i] == 0.0f;
+                }
+                if (temp == 0.0f) {
+                    ok &= std::fabs(p[i] - c[i]) < 1e-6;
+                }
+                sum_p += p[i];
+                sum_c += c[i];
+            }
+            ok &= std::fabs(sum_p - 1.0) < 1e-6 && std::fabs(sum_c - 1.0) < 1e-6;
+        }
+    }
+    printf("MTP padded-head confidence and graph reuse: %s\n", ok ? "OK" : "FAILED");
+    ggml_backend_buffer_free(buf);
+    ggml_free(ctx);
+    ggml_backend_free(backend);
+    return ok;
+#endif
+}
+
 int main(int argc, char ** argv) {
     const int64_t n_samples = argc > 1 ? atoll(argv[1]) : 200000;
 
-    bool ok = true;
+    bool ok = test_mtp_padding();
+
+    if (argc > 1 && std::string(argv[1]) == "--mtp-padding-only") {
+        return ok ? 0 : 1;
+    }
 
     ok &= spec_sim::test((int) std::max<int64_t>(n_samples/100, 200));
 

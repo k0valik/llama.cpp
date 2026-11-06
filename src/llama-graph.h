@@ -209,6 +209,7 @@ public:
         : n_pos_per_embd(n_pos_per_embd), n_first(n_first), n_steps(n_steps), dh(dh) {}
     virtual ~llm_graph_input_mtp_draft() = default;
 
+    ggml_tensor * mask_logits(ggml_context * ctx, ggml_tensor * logits);
     void set_input(const llama_ubatch * ubatch) override;
 
     bool can_reuse(const llm_graph_params & params) override;
@@ -220,6 +221,7 @@ public:
     // n_pos_per_embd values for each of the (n_steps - 1) draft slots
     ggml_tensor * pos    = nullptr; // I32 [n_pos_per_embd*(n_first + n_steps - 1)]
     ggml_tensor * rng    = nullptr; // I32 [6] parameters of ggml_add_gumbel for the draft noise (cparams.mtp_draft_noise)
+    ggml_tensor * logit_mask = nullptr; // F32 [n_rows] excludes padding from selection and confidence
 
     const uint32_t n_pos_per_embd;
     const int64_t  n_first;
