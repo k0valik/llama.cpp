@@ -615,7 +615,14 @@ static constexpr __host__ __device__ bool ggml_cuda_fattn_mma_q4_0_direct(const 
     return ncols <= 32;
 }
 
-static constexpr __host__ __device__ int ggml_cuda_fattn_mma_q4_0_nstages(const int ncols) {
+static constexpr __host__ __device__ int ggml_cuda_fattn_mma_q4_0_nstages(const int ncols, const int kind = 1) {
+    if (kind >= 2 && ncols > 4) {
+        // Mixed Q5_0/Q4_1 rows are wider (336 bytes vs 288 bytes in Q4_0) and dequantize
+        // into an F16 tile without direct fragments. For ncols > 4, 3 stages exceeds
+        // sm120a's 101376-byte dynamic shared memory limit (105216 bytes at ncols=32).
+        // 2 stages reduces this to 81408 bytes, safely within hardware limits.
+        return 2;
+    }
     return ggml_cuda_fattn_mma_q4_0_direct(ncols) ? GGML_CUDA_FA_Q4_0_NSTAGES_DIRECT : GGML_CUDA_FA_Q4_0_NSTAGES_TILE;
 }
 
@@ -814,7 +821,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_q4_0_step(
         const int stride_K, const int stride_V, const int stride_mask,
         const int jt, const uint3 ne01, const int kb0, const int kb0_start, const int kb0_stop) {
     constexpr bool direct     = kind == 1 && ggml_cuda_fattn_mma_q4_0_direct(ncols1*ncols2);
-    constexpr int nstages     = ggml_cuda_fattn_mma_q4_0_nstages(ncols1*ncols2);
+    constexpr int nstages     = ggml_cuda_fattn_mma_q4_0_nstages(ncols1*ncols2, kind);
     constexpr int stage_bytes = ggml_cuda_fattn_mma_q4_0_stage_bytes(DKQ, DV, ncols1, nbatch_fa, kind);
     constexpr int mask_bytes  = ncols1*(nbatch_fa + 8)*(int) sizeof(half);
 
@@ -1769,7 +1776,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
     // nstages > 1: don't instantiate the direct fragments for archs without the q4_0 pipeline (their configs may not fit).
     constexpr bool q4_0_direct     = q4_0_KV == 1 && nstages > 1 && ggml_cuda_fattn_mma_q4_0_direct(ncols);
     char  * tile_KV_stages = q4_0_direct ? (char *) (tile_Q + ncols*stride_tile_Q) : (char *) tile_mask;
-    constexpr int q4_0_nstages     = ggml_cuda_fattn_mma_q4_0_nstages(ncols);
+    constexpr int q4_0_nstages     = ggml_cuda_fattn_mma_q4_0_nstages(ncols, q4_0_KV);
     constexpr int q4_0_stage_bytes = ggml_cuda_fattn_mma_q4_0_stage_bytes(DKQ, DV, ncols1, nbatch_fa, q4_0_KV);
     constexpr int q4_0_mask_bytes  = ncols1*(nbatch_fa + 8)*(int) sizeof(half);
     static_assert(!q4_0_KV || q4_0_nstages >= 2, "bad q4_0 nstages");
@@ -2644,7 +2651,7 @@ void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml
     //     otherwise by a single F16 tile for K and V.
     const size_t nbytes_shared_mask      = q4_0_KV ? 0 : ncols1 * (nbatch_fa/2 + 4) * sizeof(half2);
     const size_t nbytes_shared_KV_q4_0   = (q4_0_KV == 1 && ggml_cuda_fattn_mma_q4_0_direct(ncols) ? nbytes_shared_Q : nbytes_shared_KV_1stage) +
-        ggml_cuda_fattn_mma_q4_0_nstages(ncols)*ggml_cuda_fattn_mma_q4_0_stage_bytes(DKQ, DV, ncols1, nbatch_fa, q4_0_KV);
+        ggml_cuda_fattn_mma_q4_0_nstages(ncols, q4_0_KV)*ggml_cuda_fattn_mma_q4_0_stage_bytes(DKQ, DV, ncols1, nbatch_fa, q4_0_KV);
 
     const size_t nbytes_shared_KV = q4_0_KV ? nbytes_shared_KV_q4_0 : (nstages <= 1 ? nbytes_shared_KV_1stage : nbytes_shared_KV_2stage);
 

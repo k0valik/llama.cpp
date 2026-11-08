@@ -200,10 +200,10 @@ static bool ggml_cuda_flash_attn_ext_mma_f16_use_packed_KV(const int cc, const g
     // The direct Q4 loader does not gather the upstream per-query KV row map.
     if (dst->src[5] || K->type != (mixed ? GGML_TYPE_Q5_0 : GGML_TYPE_Q4_0) ||
             V->type != (mixed ? GGML_TYPE_Q4_1 : GGML_TYPE_Q4_0) ||
-            // Keep prefill on the existing conversion/MMA path until the tiled
-            // unpacker is fast enough for larger query batches.
+            // Intermediate batches use packed tiles to avoid full-cache F16 scratch.
+            // Larger batches retain INT8/conversion prefill unless explicitly opted in.
             (mixed && (!GGML_CUDA_CC_IS_NVIDIA(cc) || cc < GGML_CUDA_CC_BLACKWELL ||
-                       (Q->ne[1] > 4 && getenv("GGML_CUDA_MIXED_TILED_PREFILL") == nullptr))) ||
+                       (Q->ne[1] >= 64 && getenv("GGML_CUDA_MIXED_TILED_PREFILL") == nullptr))) ||
             K->ne[0] != 256 || V->ne[0] != 256 || !cp_async_available(cc)) {
         return false;
     }
@@ -382,14 +382,18 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2(ggml_backend_cuda_con
         }
     }
 
-    // Large batches with F16 or directly read q4_0 K/V are compute bound: use the largest ncols2 that divides the GQA ratio
-    //     so that no tensor core work is spent on padding heads (e.g. GQA 6 would waste 1/4 of it with ncols2 == 8).
-    //     Only tested on consumer Blackwell, where this is the fallback of the INT8 kernel in fattn-mma-q4i8.cu.
+    // Avoid padding GQA heads for large F16/packed batches and intermediate packed mixed batches
+    //     (e.g. GQA 6 would waste 1/4 of the tensor core work with ncols2 == 8).
+    //     Keep short-query behavior and the matched-config conversion reference unchanged.
     if constexpr (DKQ == 256 && DV == 256) {
         const bool KV_f16 = K->type == GGML_TYPE_F16 && V->type == GGML_TYPE_F16;
-        if (use_gqa_opt && Q->ne[1] >= 64 && gqa_ratio % 8 != 0 && gqa_ratio % 2 == 0 &&
+        const bool mixed = K->type == GGML_TYPE_Q5_0 && V->type == GGML_TYPE_Q4_1;
+        const char * match_env = mixed ? getenv("GGML_CUDA_MIXED_MATCH_CONFIG") : nullptr;
+        const bool KV_mixed = mixed && !(match_env && strcmp(match_env, "1") == 0) &&
+                              ggml_cuda_flash_attn_ext_mma_f16_use_mixed_KV(cc, dst);
+        if (use_gqa_opt && (Q->ne[1] >= 64 || (KV_mixed && Q->ne[1] > 4)) && gqa_ratio % 8 != 0 && gqa_ratio % 2 == 0 &&
                 GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_BLACKWELL && cc < GGML_CUDA_CC_RUBIN &&
-                (KV_f16 || ggml_cuda_flash_attn_ext_mma_f16_use_q4_0_KV(cc, dst))) {
+                (KV_f16 || KV_mixed || ggml_cuda_flash_attn_ext_mma_f16_use_q4_0_KV(cc, dst))) {
             if (gqa_ratio % 4 == 0) {
                 ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<DKQ, DV, 4>(ctx, dst);
             } else {
@@ -903,6 +907,7 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
 
     bool need_f16_K = false;
     bool need_f16_V = false;
+    bool use_q4i8 = false;
 
     switch (kernel) {
         case BEST_FATTN_KERNEL_TILE:
@@ -910,8 +915,8 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
             need_f16_V = true;
             break;
         case BEST_FATTN_KERNEL_MMA_F16: {
-            const bool use_q4i8 = getenv("GGML_CUDA_FA_NO_Q4I8") == nullptr &&
-                                 ggml_cuda_flash_attn_ext_mma_q4i8_supported(device, dst);
+            use_q4i8 = getenv("GGML_CUDA_FA_NO_Q4I8") == nullptr &&
+                       ggml_cuda_flash_attn_ext_mma_q4i8_supported(device, dst);
             // INT8 dispatch takes precedence over the optional packed prefill path.
             need_f16_K = use_q4i8 ? K->type != GGML_TYPE_Q4_0 && !ggml_cuda_flash_attn_ext_mma_q4i8_use_mixed_KV(dst) :
                          !ggml_cuda_flash_attn_ext_mma_f16_use_q4_0_KV(ggml_cuda_info().devices[device].cc, dst) &&
@@ -930,7 +935,16 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
     const ggml_cuda_flash_attn_ext_f16_extra_data f16_extra =
         ggml_cuda_flash_attn_ext_get_f16_extra_data(dst, need_f16_K, need_f16_V);
 
-    return f16_extra.end - (uintptr_t) dst->data;
+    const size_t alloc_size = f16_extra.end - (uintptr_t) dst->data;
+    if (K->type == GGML_TYPE_Q5_0 && V->type == GGML_TYPE_Q4_1 && getenv("GGML_CUDA_MIXED_TRACE")) {
+        // Reservation intent, separate from MIXED_DISPATCH/MIXED_MMA execution records.
+        fprintf(stderr, "MIXED_ALLOC kernel=%d int8=%d queries=%lld kv=%lld sequences=%lld gqa=%lld "
+            "k_row=%zu v_row=%zu convert_k=%d convert_v=%d out_bytes=%zu extra_bytes=%zu total_bytes=%zu\n",
+            (int) kernel, use_q4i8 ? 1 : 0, (long long) Q->ne[1], (long long) K->ne[1], (long long) Q->ne[3],
+            (long long) (Q->ne[2]/K->ne[2]), K->nb[1], V->nb[1], need_f16_K ? 1 : 0, need_f16_V ? 1 : 0,
+            ggml_nbytes(dst), alloc_size - ggml_nbytes(dst), alloc_size);
+    }
+    return alloc_size;
 }
 
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)

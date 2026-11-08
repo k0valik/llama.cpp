@@ -13903,6 +13903,35 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {nr2, 2}, 1024, 77, true, false, 0, 0,
             GGML_PREC_F32, GGML_TYPE_Q5_0, GGML_TYPE_Q4_1, {0, 1, 2, 3}, true));
     }
+    // Intermediate packed mixed batches, partial tiles and the INT8 boundary.
+    for (int nb : {5, 8, 16, 31, 33, 63, 65}) {
+        for (bool kv_view : {false, true}) {
+            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 512, nb, true, false, 0, 0,
+                GGML_PREC_F32, GGML_TYPE_Q5_0, GGML_TYPE_Q4_1, {0, 2, 1, 3}, kv_view));
+        }
+    }
+    for (int64_t nr2 : {2, 4, 8}) {
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {nr2, 2}, 512, 33, true, false, 0, 0,
+            GGML_PREC_F32, GGML_TYPE_Q5_0, GGML_TYPE_Q4_1, {0, 2, 1, 3}));
+    }
+    // Odd ratios retain generic grouping; non-power-of-two even ratios avoid padding heads.
+    for (int64_t nr2 : {3, 10, 12}) {
+        for (int nb : {5, 33}) {
+            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {nr2, 2}, 512, nb, true, false, 0, 0,
+                GGML_PREC_F32, GGML_TYPE_Q5_0, GGML_TYPE_Q4_1, {0, 2, 1, 3}));
+        }
+    }
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 512, 5, false, false, 0, 0,
+        GGML_PREC_F32, GGML_TYPE_Q5_0, GGML_TYPE_Q4_1));
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 512, 33, true, false, 8, 0,
+        GGML_PREC_F32, GGML_TYPE_Q5_0, GGML_TYPE_Q4_1));
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 512, 63, true, false, 0, 2,
+        GGML_PREC_F32, GGML_TYPE_Q5_0, GGML_TYPE_Q4_1));
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 513, 33, true, false, 0, 0,
+        GGML_PREC_F32, GGML_TYPE_Q5_0, GGML_TYPE_Q4_1));
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 512, 33, true, true, 0, 0,
+        GGML_PREC_F32, GGML_TYPE_Q5_0, GGML_TYPE_Q4_1));
+
     // INT8 prefill boundary, partial query tile, multiple sequences and guarded fallbacks.
     for (int nb : {63, 77}) {
         test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 2}, 512, nb, true, false, 0, 0,
